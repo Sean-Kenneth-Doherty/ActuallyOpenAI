@@ -85,6 +85,8 @@ class AOAINode:
         self.ledger = None
         self.ipfs_storage = None
         self.rewarder = None
+        self.adaptive_miner = None  # NEW: Adaptive mining system
+        self.model_inference = None  # Model inference engine
         
         self.is_running = False
     
@@ -120,6 +122,8 @@ class AOAINode:
         from actuallyopenai.network.ipfs_storage import IPFSModelStorage
         from actuallyopenai.network.api_mesh import DecentralizedAPIMesh
         from actuallyopenai.token.aoai_token import AOAIWallet, AOAILedger, ComputeRewarder
+        from actuallyopenai.api.model_inference import ModelInference
+        from actuallyopenai.mining.adaptive_miner import AdaptiveMiner
         
         # Create or load wallet
         wallet_path = self.data_dir / "wallet.json"
@@ -136,6 +140,29 @@ class AOAINode:
         
         # Initialize rewarder
         self.rewarder = ComputeRewarder(self.ledger)
+        
+        # Initialize model inference
+        self.model_inference = ModelInference()
+        logger.info("🧠 Model inference engine loaded")
+        
+        # Initialize adaptive miner (NEW!)
+        self.adaptive_miner = AdaptiveMiner(
+            model_inference=self.model_inference,
+            data_dir=str(self.data_dir / "mining"),
+            wallet_address=self.wallet.address
+        )
+        
+        # Connect miner to token system
+        def on_tokens_earned(amount, work_type):
+            self.rewarder.record_work(
+                self.wallet.address,
+                work_type=work_type,
+                compute_units=amount / 0.01,  # Convert back to units
+                proof={"auto": True}
+            )
+        
+        self.adaptive_miner.on_tokens_earned = on_tokens_earned
+        logger.info("⚡ Adaptive miner initialized (50/50 dynamic split)")
         
         # Initialize IPFS storage
         self.ipfs_storage = IPFSModelStorage(
@@ -185,28 +212,17 @@ class AOAINode:
         """Start API mesh"""
         logger.info("🔌 Starting API mesh...")
         
-        # Register local inference handler
+        # Register local inference handler that uses adaptive miner
         async def chat_handler(data: dict) -> dict:
             try:
-                # Try to use local model
-                from actuallyopenai.api.model_inference import ModelInference
-                inference = ModelInference()
-                
                 messages = data.get("messages", [])
                 prompt = messages[-1]["content"] if messages else ""
                 
-                response = inference.generate(
+                # Use adaptive miner for inference (tracks demand automatically)
+                response = await self.adaptive_miner.handle_inference(
                     prompt,
                     max_new_tokens=data.get("max_tokens", 256),
                     temperature=data.get("temperature", 0.7)
-                )
-                
-                # Record work for tokens
-                self.rewarder.record_work(
-                    self.wallet.address,
-                    work_type="inference",
-                    compute_units=0.1,
-                    proof={"prompt_length": len(prompt)}
                 )
                 
                 return {
@@ -226,15 +242,29 @@ class AOAINode:
         
         self.api_mesh.register_handler("chat", chat_handler)
         
+        # Provide miner stats to the mesh
+        def get_miner_stats():
+            if self.adaptive_miner:
+                stats = self.adaptive_miner.get_stats()
+                return stats
+            return None
+        
+        self.api_mesh.stats_provider = get_miner_stats
+        
         await self.api_mesh.start()
+        
+        # Start adaptive miner (handles both inference tracking AND training)
+        if self.enable_mining:
+            await self.adaptive_miner.start()
+            logger.info("🔄 Adaptive mining started (auto-balancing inference/training)")
     
     async def _mining_loop(self):
-        """Mine blocks and process rewards"""
-        logger.info("⛏️ Mining enabled - contributing compute...")
+        """Mine blocks and process rewards (block mining only - training handled by adaptive miner)"""
+        logger.info("⛏️ Block mining enabled...")
         
         while self.is_running:
             try:
-                # Mine pending transactions
+                # Mine pending transactions (token ledger)
                 block = self.ledger.mine_block(self.wallet.address)
                 if block:
                     logger.info(f"⛏️ Mined block #{block.index}!")
@@ -259,6 +289,10 @@ class AOAINode:
 ╠═══════════════════════════════════════════════════════════════════════════╣
 ║  P2P Port: {self.p2p_port}      │  API Port: {self.api_port}                              ║
 ║  Mining: {'ON' if self.enable_mining else 'OFF'}          │  Peers: {len(self.p2p_node.peers) if self.p2p_node else 0}                                     ║
+╠═══════════════════════════════════════════════════════════════════════════╣
+║  Adaptive Mining:                                                         ║
+║    Mode: {"Training+Inference" if self.adaptive_miner else "Inference Only"}                                           ║
+║    Compute Split: Based on API demand (50/50 to 100/0)                    ║
 ╠═══════════════════════════════════════════════════════════════════════════╣
 ║  Network Stats:                                                           ║
 ║    Total Minted: {stats['total_minted']:>12,.2f} AOAI                                    ║
@@ -287,7 +321,16 @@ class AOAINode:
                 # Print periodic stats
                 balance = self.ledger.get_balance(self.wallet.address)
                 peers = len(self.p2p_node.peers) if self.p2p_node else 0
-                logger.info(f"📊 Balance: {balance:.4f} AOAI | Peers: {peers}")
+                
+                # Include adaptive miner stats if available
+                if self.adaptive_miner:
+                    stats = self.adaptive_miner.get_stats()
+                    mode = stats["mode"]
+                    inf_ratio = stats["allocation"]["inference"] * 100
+                    demand = stats["demand"]["level"] * 100
+                    logger.info(f"📊 Balance: {balance:.4f} AOAI | Peers: {peers} | Mode: {mode} | Inference: {inf_ratio:.0f}% | Demand: {demand:.1f}%")
+                else:
+                    logger.info(f"📊 Balance: {balance:.4f} AOAI | Peers: {peers}")
                 
         except asyncio.CancelledError:
             pass

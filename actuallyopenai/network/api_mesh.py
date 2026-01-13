@@ -178,6 +178,9 @@ class DecentralizedAPIMesh:
         # API handlers
         self.handlers: Dict[str, Callable] = {}
         
+        # External stats provider (for adaptive miner etc)
+        self.stats_provider: Optional[Callable] = None
+        
         # Web app
         self.app = web.Application()
         self._setup_routes()
@@ -476,14 +479,25 @@ class DecentralizedAPIMesh:
         if self.load_balancer.nodes:
             avg_latency = sum(n.latency_ms for n in self.load_balancer.nodes.values()) / len(self.load_balancer.nodes)
         
-        return web.json_response({
+        stats = {
             "total_nodes": len(self.load_balancer.nodes) + 1,  # +1 for self
             "healthy_nodes": healthy_nodes + 1,
             "total_capacity_rps": total_capacity,
             "avg_latency_ms": avg_latency,
             "cache_entries": len(self.request_cache),
             "uptime": time.time()
-        })
+        }
+        
+        # Add external stats (e.g., adaptive miner)
+        if self.stats_provider:
+            try:
+                extra_stats = self.stats_provider()
+                if extra_stats:
+                    stats["miner"] = extra_stats
+            except Exception as e:
+                logger.debug(f"Stats provider error: {e}")
+        
+        return web.json_response(stats)
     
     def register_handler(self, endpoint: str, handler: Callable):
         """Register a local handler for an endpoint"""
