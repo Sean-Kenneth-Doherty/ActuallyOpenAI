@@ -1,0 +1,279 @@
+# =============================================================================
+# ActuallyOpenAI Alert Rules
+# Production alerting for distributed AI training platform
+# =============================================================================
+
+groups:
+  # =============================================================================
+  # API Health Alerts
+  # =============================================================================
+  - name: api_health
+    interval: 30s
+    rules:
+      - alert: APIHighErrorRate
+        expr: |
+          (sum(rate(aoai_api_requests_total{status=~"5.."}[5m])) 
+           / sum(rate(aoai_api_requests_total[5m]))) * 100 > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "High API error rate"
+          description: "API error rate is {{ $value | printf \"%.2f\" }}% (threshold: 5%)"
+          runbook_url: "https://docs.actuallyopenai.com/runbooks/api-errors"
+
+      - alert: APIHighLatency
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(aoai_api_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High API latency on {{ $labels.endpoint }}"
+          description: "P95 latency is {{ $value | printf \"%.2f\" }}s (threshold: 2s)"
+
+      - alert: APIDown
+        expr: up{job="aoai-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "API server is down"
+          description: "API instance {{ $labels.instance }} is not responding"
+
+      - alert: APIHighRateLimitHits
+        expr: sum(rate(aoai_rate_limit_exceeded_total[5m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High rate limit hits"
+          description: "{{ $value | printf \"%.0f\" }} rate limit hits per second"
+
+  # =============================================================================
+  # Training Infrastructure Alerts
+  # =============================================================================
+  - name: training_health
+    interval: 30s
+    rules:
+      - alert: TrainingLossSpike
+        expr: |
+          aoai_training_loss > 
+          (aoai_training_loss offset 1h) * 2
+        for: 15m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Training loss spike detected"
+          description: "Loss increased significantly from {{ $value | printf \"%.4f\" }}"
+
+      - alert: TrainingStalled
+        expr: |
+          increase(aoai_training_steps_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: critical
+          team: ml
+        annotations:
+          summary: "Training has stalled"
+          description: "No training progress in the last 30 minutes"
+
+      - alert: LowWorkerCount
+        expr: aoai_workers_active < 5
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Low active worker count"
+          description: "Only {{ $value }} workers active (minimum: 5)"
+
+      - alert: NoActiveWorkers
+        expr: aoai_workers_active == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "No active workers"
+          description: "All workers are offline, training cannot proceed"
+
+      - alert: HighWorkerFailureRate
+        expr: |
+          (sum(rate(aoai_worker_failures_total[15m])) 
+           / sum(rate(aoai_worker_task_completed_total[15m]))) * 100 > 10
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High worker failure rate"
+          description: "{{ $value | printf \"%.1f\" }}% of worker tasks are failing"
+
+  # =============================================================================
+  # GPU & Resource Alerts
+  # =============================================================================
+  - name: gpu_health
+    interval: 30s
+    rules:
+      - alert: GPUHighTemperature
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "GPU temperature high on {{ $labels.instance }}"
+          description: "GPU {{ $labels.gpu }} temperature is {{ $value }}°C"
+
+      - alert: GPUMemoryAlmostFull
+        expr: |
+          (DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_TOTAL) * 100 > 95
+        for: 10m
+        labels:
+          severity: warning
+          team: infra
+        annotations:
+          summary: "GPU memory almost full"
+          description: "GPU {{ $labels.gpu }} memory usage is {{ $value | printf \"%.1f\" }}%"
+
+      - alert: GPUUtilizationLow
+        expr: DCGM_FI_DEV_GPU_UTIL < 20
+        for: 30m
+        labels:
+          severity: info
+          team: ml
+        annotations:
+          summary: "GPU underutilized"
+          description: "GPU {{ $labels.gpu }} utilization is only {{ $value }}%"
+
+  # =============================================================================
+  # Database Alerts
+  # =============================================================================
+  - name: database_health
+    interval: 60s
+    rules:
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL database is not responding"
+
+      - alert: PostgreSQLHighConnections
+        expr: |
+          (pg_stat_activity_count / pg_settings_max_connections) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "PostgreSQL connections high"
+          description: "{{ $value | printf \"%.1f\" }}% of max connections used"
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Redis is down"
+          description: "Redis cache is not responding"
+
+      - alert: RedisMemoryHigh
+        expr: |
+          (redis_memory_used_bytes / redis_memory_max_bytes) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Redis memory usage high"
+          description: "Redis memory usage is {{ $value | printf \"%.1f\" }}%"
+
+  # =============================================================================
+  # Blockchain & Token Alerts
+  # =============================================================================
+  - name: blockchain_health
+    interval: 60s
+    rules:
+      - alert: DividendDistributionFailed
+        expr: increase(aoai_dividend_distribution_failures_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: blockchain
+        annotations:
+          summary: "Dividend distribution failed"
+          description: "{{ $value }} dividend distributions failed in the last hour"
+
+      - alert: TokenMintingDelayed
+        expr: time() - aoai_last_token_mint_timestamp > 86400
+        for: 1h
+        labels:
+          severity: warning
+          team: blockchain
+        annotations:
+          summary: "Token minting delayed"
+          description: "No tokens minted in the last 24 hours"
+
+      - alert: LowContractBalance
+        expr: aoai_contract_balance_eth < 1
+        for: 30m
+        labels:
+          severity: warning
+          team: blockchain
+        annotations:
+          summary: "Low contract ETH balance"
+          description: "Contract balance is {{ $value }} ETH"
+
+  # =============================================================================
+  # Business Metrics Alerts
+  # =============================================================================
+  - name: business_metrics
+    interval: 5m
+    rules:
+      - alert: RevenueDropped
+        expr: |
+          increase(aoai_revenue_total_usd[1d]) < 
+          increase(aoai_revenue_total_usd[1d] offset 1d) * 0.5
+        for: 4h
+        labels:
+          severity: warning
+          team: business
+        annotations:
+          summary: "Significant revenue drop"
+          description: "Revenue dropped more than 50% compared to yesterday"
+
+      - alert: NewUserRegistrationsLow
+        expr: increase(aoai_user_registrations_total[1d]) < 10
+        for: 1d
+        labels:
+          severity: info
+          team: growth
+        annotations:
+          summary: "Low new user registrations"
+          description: "Only {{ $value }} new users registered in the last 24 hours"
+
+      - alert: HighChurnRate
+        expr: |
+          (increase(aoai_users_churned_total[7d]) 
+           / aoai_active_users_total) * 100 > 5
+        for: 1d
+        labels:
+          severity: warning
+          team: business
+        annotations:
+          summary: "High user churn rate"
+          description: "{{ $value | printf \"%.1f\" }}% users churned this week"

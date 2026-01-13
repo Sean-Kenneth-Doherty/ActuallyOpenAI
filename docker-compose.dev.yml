@@ -1,0 +1,173 @@
+# =============================================================================
+# ActuallyOpenAI Development Docker Compose
+# Local development environment with hot reloading
+# =============================================================================
+
+services:
+  # =============================================================================
+  # API Server (Development mode with hot reload)
+  # =============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      target: builder  # Use builder stage for dev
+    volumes:
+      - ./actuallyopenai:/app/actuallyopenai:ro
+      - ./tests:/app/tests:ro
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=1
+      - LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql://aoai:aoai_dev@postgres:5432/aoai_dev
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=dev-secret-key-not-for-production
+    command: >
+      uvicorn actuallyopenai.api.production_api:app
+      --host 0.0.0.0 
+      --port 8000 
+      --reload
+      --reload-dir /app/actuallyopenai
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # Dashboard (Development mode)
+  # =============================================================================
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+      target: builder
+    volumes:
+      - ./actuallyopenai:/app/actuallyopenai:ro
+    ports:
+      - "8501:8501"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=1
+      - API_URL=http://api:8000
+    command: >
+      uvicorn actuallyopenai.web.dashboard:app
+      --host 0.0.0.0
+      --port 8501
+      --reload
+      --reload-dir /app/actuallyopenai
+    depends_on:
+      - api
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # Orchestrator (Development mode)
+  # =============================================================================
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/orchestrator.Dockerfile
+      target: builder
+    volumes:
+      - ./actuallyopenai:/app/actuallyopenai:ro
+      - ./checkpoints:/app/checkpoints
+    ports:
+      - "8002:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=1
+      - LOG_LEVEL=DEBUG
+      - REDIS_URL=redis://redis:6379
+      - CHECKPOINT_DIR=/app/checkpoints
+      - MIN_WORKERS=0  # Allow starting without workers in dev
+    command: >
+      uvicorn actuallyopenai.orchestrator.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/actuallyopenai
+    depends_on:
+      - redis
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # PostgreSQL Database
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=aoai
+      - POSTGRES_PASSWORD=aoai_dev
+      - POSTGRES_DB=aoai_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aoai -d aoai_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # Redis Cache
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # Adminer (Database UI)
+  # =============================================================================
+  adminer:
+    image: adminer:latest
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    networks:
+      - aoai-dev
+
+  # =============================================================================
+  # Redis Commander (Redis UI)
+  # =============================================================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - aoai-dev
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  aoai-dev:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_dev_data:
+  redis_dev_data:
