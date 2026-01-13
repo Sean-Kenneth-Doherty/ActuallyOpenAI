@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ActuallyOpenAI - The People's AI</title>
+    <meta name="description" content="A decentralized AI that belongs to everyone. Contribute compute, earn tokens, share in the future.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --dark: #0f172a;
+            --light: #f8fafc;
+            --gray: #64748b;
+        }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--dark);
+            color: var(--light);
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        /* Hero Section */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: '';
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--primary) 0%, transparent 70%);
+            opacity: 0.15;
+            top: -200px;
+            right: -200px;
+            animation: pulse 8s infinite;
+        }
+        
+        .hero::after {
+            content: '';
+            position: absolute;
+            width: 400px;
+            height: 400px;
+            background: radial-gradient(circle, var(--secondary) 0%, transparent 70%);
+            opacity: 0.1;
+            bottom: -100px;
+            left: -100px;
+            animation: pulse 6s infinite reverse;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.15; }
+            50% { transform: scale(1.2); opacity: 0.2; }
+        }
+        
+        .logo {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 2rem;
+            letter-spacing: 0.1em;
+        }
+        
+        h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 900;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--light) 0%, var(--primary) 50%, var(--secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .tagline {
+            font-size: clamp(1.2rem, 3vw, 1.5rem);
+            color: var(--gray);
+            margin-bottom: 3rem;
+            max-width: 600px;
+        }
+        
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            justify-content: center;
+            z-index: 10;
+        }
+        
+        .btn {
+            padding: 1rem 2rem;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+            border: none;
+        }
+        
+        .btn-primary:hover {
+            background: var(--primary-dark);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 40px rgba(99, 102, 241, 0.3);
+        }
+        
+        .btn-secondary {
+            background: transparent;
+            color: var(--light);
+            border: 2px solid var(--gray);
+        }
+        
+        .btn-secondary:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        
+        /* Features */
+        .features {
+            padding: 100px 0;
+            background: linear-gradient(180deg, var(--dark) 0%, #1e293b 100%);
+        }
+        
+        .section-title {
+            font-size: 2.5rem;
+            text-align: center;
+            margin-bottom: 4rem;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+        
+        .feature-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 2rem;
+            transition: all 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--primary);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+        
+        .feature-icon {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .feature-card h3 {
+            font-size: 1.3rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .feature-card p {
+            color: var(--gray);
+        }
+        
+        /* How it Works */
+        .how-it-works {
+            padding: 100px 0;
+        }
+        
+        .steps {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+        
+        .step {
+            text-align: center;
+            max-width: 250px;
+        }
+        
+        .step-number {
+            width: 60px;
+            height: 60px;
+            background: var(--primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 0 auto 1rem;
+        }
+        
+        .step h3 {
+            margin-bottom: 0.5rem;
+        }
+        
+        .step p {
+            color: var(--gray);
+            font-size: 0.95rem;
+        }
+        
+        /* Stats */
+        .stats {
+            padding: 80px 0;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 2rem;
+            text-align: center;
+        }
+        
+        .stat-number {
+            font-size: 3rem;
+            font-weight: 900;
+        }
+        
+        .stat-label {
+            font-size: 1rem;
+            opacity: 0.9;
+        }
+        
+        /* API Demo */
+        .api-demo {
+            padding: 100px 0;
+            background: #1e293b;
+        }
+        
+        .code-block {
+            background: var(--dark);
+            border-radius: 12px;
+            padding: 2rem;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            max-width: 700px;
+            margin: 2rem auto;
+        }
+        
+        .code-block .comment { color: #6b7280; }
+        .code-block .keyword { color: #c084fc; }
+        .code-block .string { color: #34d399; }
+        .code-block .function { color: #60a5fa; }
+        
+        /* Footer */
+        footer {
+            padding: 60px 0;
+            text-align: center;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .footer-links {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+        
+        .footer-links a {
+            color: var(--gray);
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+        
+        .footer-links a:hover {
+            color: var(--primary);
+        }
+        
+        .copyright {
+            color: var(--gray);
+            font-size: 0.9rem;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero {
+                padding: 40px 20px;
+            }
+            
+            .cta-buttons {
+                flex-direction: column;
+                width: 100%;
+            }
+            
+            .btn {
+                width: 100%;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Hero -->
+    <section class="hero">
+        <div class="container">
+            <div class="logo">ACTUALLYOPENAI</div>
+            <h1>The People's AI</h1>
+            <p class="tagline">
+                A decentralized artificial intelligence that belongs to everyone. 
+                Contribute compute power, earn tokens, and share in the future of AI.
+            </p>
+            <div class="cta-buttons">
+                <a href="https://github.com/actuallyopenai/actuallyopenai" class="btn btn-primary">
+                    ⭐ Star on GitHub
+                </a>
+                <a href="#get-started" class="btn btn-secondary">
+                    Get Started →
+                </a>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Features -->
+    <section class="features" id="features">
+        <div class="container">
+            <h2 class="section-title">Why ActuallyOpenAI?</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🌐</div>
+                    <h3>Truly Decentralized</h3>
+                    <p>No single company controls this AI. It's trained by the community, for the community.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💰</div>
+                    <h3>Earn While You Sleep</h3>
+                    <p>Contribute your GPU power and earn AOAI tokens. Get dividends from API revenue.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔓</div>
+                    <h3>100% Open Source</h3>
+                    <p>Every line of code is public. Audit it, improve it, make it yours.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🧠</div>
+                    <h3>Self-Improving</h3>
+                    <p>The AI continuously learns and improves as more contributors join the network.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>OpenAI Compatible</h3>
+                    <p>Drop-in replacement for OpenAI API. Switch with one line of code.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🛡️</div>
+                    <h3>Censorship Resistant</h3>
+                    <p>No single entity can shut it down. The network is the AI.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- How it Works -->
+    <section class="how-it-works" id="get-started">
+        <div class="container">
+            <h2 class="section-title">How It Works</h2>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <h3>Clone the Repo</h3>
+                    <p>Get the code from GitHub and run it locally or in Docker</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <h3>Start a Worker</h3>
+                    <p>Contribute your GPU/CPU power to train the collective AI</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <h3>Earn AOAI Tokens</h3>
+                    <p>Get rewarded based on your compute contribution</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">4</div>
+                    <h3>Receive Dividends</h3>
+                    <p>Share in revenue generated by API usage</p>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Stats -->
+    <section class="stats">
+        <div class="container">
+            <div class="stats-grid">
+                <div class="stat">
+                    <div class="stat-number">4.2M+</div>
+                    <div class="stat-label">Model Parameters</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">100%</div>
+                    <div class="stat-label">Open Source</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">∞</div>
+                    <div class="stat-label">Potential Workers</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-number">0</div>
+                    <div class="stat-label">Central Authority</div>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- API Demo -->
+    <section class="api-demo">
+        <div class="container">
+            <h2 class="section-title">Try the API</h2>
+            <div class="code-block">
+<span class="keyword">from</span> openai <span class="keyword">import</span> OpenAI
+
+client = OpenAI(
+    api_key=<span class="string">"your-aoai-key"</span>,
+    base_url=<span class="string">"https://api.actuallyopenai.org/v1"</span>
+)
+
+response = client.chat.completions.<span class="function">create</span>(
+    model=<span class="string">"aoai-1"</span>,
+    messages=[{<span class="string">"role"</span>: <span class="string">"user"</span>, <span class="string">"content"</span>: <span class="string">"Hello!"</span>}]
+)
+
+<span class="function">print</span>(response.choices[0].message.content)
+<span class="comment"># "Hello! I'm ActuallyOpenAI, a decentralized AI assistant."</span>
+            </div>
+            <div style="text-align: center;">
+                <a href="https://api.actuallyopenai.org/docs" class="btn btn-primary">
+                    View API Docs →
+                </a>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-links">
+                <a href="https://github.com/actuallyopenai/actuallyopenai">GitHub</a>
+                <a href="https://github.com/actuallyopenai/actuallyopenai#-quick-start">Documentation</a>
+                <a href="https://github.com/actuallyopenai/actuallyopenai/blob/main/CONTRIBUTING.md">Contribute</a>
+                <a href="https://twitter.com/actuallyopenai">Twitter</a>
+                <a href="https://discord.gg/actuallyopenai">Discord</a>
+            </div>
+            <p class="copyright">
+                ActuallyOpenAI © 2026 | Open Source AI for Everyone<br>
+                <small>The AI that belongs to humanity, not corporations.</small>
+            </p>
+        </div>
+    </footer>
+    
+    <script>
+        // Smooth scrolling
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                document.querySelector(this.getAttribute('href')).scrollIntoView({
+                    behavior: 'smooth'
+                });
+            });
+        });
+    </script>
+</body>
+</html>
