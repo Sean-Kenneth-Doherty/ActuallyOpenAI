@@ -197,7 +197,7 @@ class AOAINode:
                 
                 response = inference.generate(
                     prompt,
-                    max_tokens=data.get("max_tokens", 256),
+                    max_new_tokens=data.get("max_tokens", 256),
                     temperature=data.get("temperature", 0.7)
                 )
                 
@@ -356,4 +356,12 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Windows-compatible event loop
+    import sys
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")

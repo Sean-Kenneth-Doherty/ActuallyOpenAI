@@ -1,0 +1,39 @@
+{
+  "chain": [
+    {
+      "index": 0,
+      "transactions": [],
+      "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 1768346608.2081983,
+      "nonce": 0,
+      "hash": "c730875cdc01dcee4b518fd2d544f26589983b991481ac078b4ed89911824d68"
+    },
+    {
+      "index": 1,
+      "transactions": [
+        {
+          "tx_id": "b2483f6fdec5cb5f246c2aca4e57eb0d8a00047a65ec542f21cfa1b3316a5262",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 10.0,
+          "timestamp": 1768346771.8524191,
+          "data": {
+            "compute_units": 0.1,
+            "work_proof": "a53a7271ec59e41ce789022c5af206a82862507bda2606a3cb418f249bfb400a",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        }
+      ],
+      "previous_hash": "c730875cdc01dcee4b518fd2d544f26589983b991481ac078b4ed89911824d68",
+      "timestamp": 1768346771.8534114,
+      "nonce": 268,
+      "hash": "0091c6436a077197abe47c9c6731a4f56c368a6937074d8372eec132e62f023b"
+    }
+  ],
+  "balances": {
+    "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89": 10.0
+  },
+  "total_minted": 10.0
+}
