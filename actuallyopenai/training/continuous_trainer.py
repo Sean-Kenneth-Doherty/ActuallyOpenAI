@@ -553,7 +553,7 @@ class ContinuousTrainer:
         return self.state.global_step % self.checkpoint_every_steps == 0
     
     async def _checkpoint(self):
-        """Save a training checkpoint."""
+        """Save a training checkpoint with validation."""
         import os
         
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -563,10 +563,11 @@ class ContinuousTrainer:
             f"checkpoint_step_{self.state.global_step}.pt"
         )
         
+        # Create checkpoint with complete state
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer else None,
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "training_state": {
                 "global_step": self.state.global_step,
                 "epoch": self.state.epoch,
@@ -575,59 +576,353 @@ class ContinuousTrainer:
                 "total_tokens_processed": self.state.total_tokens_processed,
                 "total_compute_hours": self.state.total_compute_hours,
                 "improvements": self.state.improvements[-100:],  # Keep last 100
+                "loss_history": self.state.loss_history[-1000:],  # Keep last 1000 losses
+                "last_improvement_step": self.state.last_improvement_step,
             },
             "timestamp": datetime.utcnow().isoformat(),
-            "model_id": self.model_id
+            "model_id": self.model_id,
+            "checkpoint_version": "2.0",  # Version for compatibility
         }
         
-        torch.save(checkpoint, checkpoint_path)
+        # Compute checksum for validation
+        checkpoint["checksum"] = self._compute_checkpoint_checksum(checkpoint)
         
-        # Also save as "latest"
-        latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
-        torch.save(checkpoint, latest_path)
+        # Save to temporary file first, then rename (atomic operation)
+        temp_path = checkpoint_path + ".tmp"
+        try:
+            torch.save(checkpoint, temp_path)
+            
+            # Validate the saved checkpoint before finalizing
+            if self._validate_checkpoint_file(temp_path):
+                # Atomic rename
+                if os.path.exists(checkpoint_path):
+                    os.remove(checkpoint_path)
+                os.rename(temp_path, checkpoint_path)
+                
+                # Also save as "latest" with same atomic approach
+                latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
+                latest_temp = latest_path + ".tmp"
+                torch.save(checkpoint, latest_temp)
+                if os.path.exists(latest_path):
+                    os.remove(latest_path)
+                os.rename(latest_temp, latest_path)
+                
+                self.state.last_checkpoint_at = datetime.utcnow()
+                
+                logger.info(
+                    "Checkpoint saved and validated",
+                    path=checkpoint_path,
+                    step=self.state.global_step,
+                    loss=self.state.current_loss
+                )
+                
+                # Clean up old checkpoints (keep last 5)
+                await self._cleanup_old_checkpoints(keep=5)
+                
+                if self.on_checkpoint:
+                    await self.on_checkpoint(checkpoint_path, self.state)
+            else:
+                logger.error("Checkpoint validation failed, keeping previous checkpoint")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        except Exception as e:
+            logger.error("Failed to save checkpoint", error=str(e))
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    
+    def _compute_checkpoint_checksum(self, checkpoint: Dict) -> str:
+        """Compute a checksum for checkpoint validation."""
+        # Create a deterministic hash from key state values
+        state = checkpoint.get("training_state", {})
+        hash_data = f"{state.get('global_step', 0)}-{state.get('current_loss', 0)}-{checkpoint.get('model_id', '')}"
+        return hashlib.sha256(hash_data.encode()).hexdigest()[:32]
+    
+    def _validate_checkpoint_file(self, path: str) -> bool:
+        """Validate a checkpoint file is not corrupted."""
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            
+            # Check required keys exist
+            required_keys = ["model_state_dict", "training_state", "model_id"]
+            for key in required_keys:
+                if key not in checkpoint:
+                    logger.warning(f"Checkpoint missing required key: {key}")
+                    return False
+            
+            # Validate checksum if present
+            if "checksum" in checkpoint:
+                stored_checksum = checkpoint.pop("checksum")
+                computed_checksum = self._compute_checkpoint_checksum(checkpoint)
+                checkpoint["checksum"] = stored_checksum  # Restore for later use
+                
+                if stored_checksum != computed_checksum:
+                    logger.warning("Checkpoint checksum mismatch")
+                    return False
+            
+            # Validate model state dict has parameters
+            if not checkpoint["model_state_dict"]:
+                logger.warning("Checkpoint has empty model state")
+                return False
+            
+            # Validate training state
+            state = checkpoint["training_state"]
+            if state.get("global_step", -1) < 0:
+                logger.warning("Checkpoint has invalid global_step")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.error(f"Checkpoint validation error: {e}")
+            return False
+    
+    async def _cleanup_old_checkpoints(self, keep: int = 5):
+        """Remove old checkpoints, keeping the most recent ones."""
+        import os
+        import glob
         
-        self.state.last_checkpoint_at = datetime.utcnow()
+        pattern = os.path.join(self.checkpoint_dir, "checkpoint_step_*.pt")
+        checkpoints = glob.glob(pattern)
         
-        logger.info(
-            "Checkpoint saved",
-            path=checkpoint_path,
-            step=self.state.global_step,
-            loss=self.state.current_loss
-        )
+        if len(checkpoints) <= keep:
+            return
         
-        if self.on_checkpoint:
-            await self.on_checkpoint(checkpoint_path, self.state)
+        # Sort by step number
+        def get_step(path):
+            try:
+                basename = os.path.basename(path)
+                return int(basename.replace("checkpoint_step_", "").replace(".pt", ""))
+            except:
+                return 0
+        
+        checkpoints.sort(key=get_step, reverse=True)
+        
+        # Remove older checkpoints
+        for checkpoint_path in checkpoints[keep:]:
+            try:
+                os.remove(checkpoint_path)
+                logger.debug(f"Removed old checkpoint: {checkpoint_path}")
+            except Exception as e:
+                logger.warning(f"Failed to remove checkpoint {checkpoint_path}: {e}")
     
     async def _load_latest_checkpoint(self) -> bool:
-        """Load the latest checkpoint if it exists."""
+        """
+        Load the latest valid checkpoint with fallback to older checkpoints.
+        
+        Recovery strategy:
+        1. Try loading 'latest.pt'
+        2. If corrupted, try numbered checkpoints in reverse order
+        3. Validate checkpoint before loading
+        4. Gracefully handle partial state restoration
+        """
         import os
+        import glob
+        
+        # Build list of checkpoint candidates
+        candidates = []
         
         latest_path = os.path.join(self.checkpoint_dir, "latest.pt")
+        if os.path.exists(latest_path):
+            candidates.append(latest_path)
         
-        if not os.path.exists(latest_path):
+        # Add numbered checkpoints as fallbacks (sorted by step descending)
+        pattern = os.path.join(self.checkpoint_dir, "checkpoint_step_*.pt")
+        numbered_checkpoints = glob.glob(pattern)
+        
+        def get_step(path):
+            try:
+                basename = os.path.basename(path)
+                return int(basename.replace("checkpoint_step_", "").replace(".pt", ""))
+            except:
+                return 0
+        
+        numbered_checkpoints.sort(key=get_step, reverse=True)
+        candidates.extend(numbered_checkpoints)
+        
+        if not candidates:
+            logger.info("No checkpoints found, starting fresh")
+            return False
+        
+        # Try each candidate until one works
+        for checkpoint_path in candidates:
+            logger.info(f"Attempting to load checkpoint: {checkpoint_path}")
+            
+            if await self._try_load_checkpoint(checkpoint_path):
+                return True
+            else:
+                logger.warning(f"Failed to load checkpoint: {checkpoint_path}, trying next...")
+        
+        logger.warning("All checkpoints failed to load, starting fresh")
+        return False
+    
+    async def _try_load_checkpoint(self, checkpoint_path: str) -> bool:
+        """
+        Attempt to load a specific checkpoint file with validation.
+        
+        Returns:
+            True if checkpoint was loaded successfully, False otherwise
+        """
+        import os
+        
+        if not os.path.exists(checkpoint_path):
             return False
         
         try:
-            checkpoint = torch.load(latest_path, map_location="cpu")
+            # Validate checkpoint before loading
+            if not self._validate_checkpoint_file(checkpoint_path):
+                logger.warning(f"Checkpoint validation failed: {checkpoint_path}")
+                return False
             
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             
-            state_data = checkpoint["training_state"]
-            self.state.global_step = state_data["global_step"]
-            self.state.epoch = state_data["epoch"]
-            self.state.current_loss = state_data["current_loss"]
-            self.state.best_loss = state_data["best_loss"]
-            self.state.total_tokens_processed = state_data["total_tokens_processed"]
-            self.state.total_compute_hours = state_data["total_compute_hours"]
-            self.state.improvements = state_data.get("improvements", [])
+            # Load model state (required)
+            model_state = checkpoint.get("model_state_dict")
+            if model_state:
+                try:
+                    self.model.load_state_dict(model_state, strict=False)
+                    logger.info("Model state loaded successfully")
+                except Exception as e:
+                    logger.error(f"Failed to load model state: {e}")
+                    return False
+            else:
+                logger.error("Checkpoint missing model_state_dict")
+                return False
+            
+            # Load optimizer state (optional but important)
+            optimizer_state = checkpoint.get("optimizer_state_dict")
+            if optimizer_state and self.optimizer:
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                    logger.info("Optimizer state loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to load optimizer state, using fresh optimizer: {e}")
+            
+            # Load scheduler state (optional)
+            scheduler_state = checkpoint.get("scheduler_state_dict")
+            if scheduler_state and self.scheduler:
+                try:
+                    self.scheduler.load_state_dict(scheduler_state)
+                    logger.info("Scheduler state loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to load scheduler state, using fresh scheduler: {e}")
+            
+            # Load training metadata
+            await self._restore_training_state(checkpoint.get("training_state", {}))
+            
+            logger.info(
+                "Checkpoint loaded successfully",
+                path=checkpoint_path,
+                step=self.state.global_step,
+                loss=self.state.current_loss
+            )
             
             return True
             
-        except Exception as e:
-            logger.error("Failed to load checkpoint", error=str(e))
+        except torch.serialization.pickle.UnpicklingError as e:
+            logger.error(f"Checkpoint corrupted (pickle error): {checkpoint_path}, {e}")
             return False
+        except RuntimeError as e:
+            logger.error(f"Checkpoint incompatible with model: {checkpoint_path}, {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error loading checkpoint: {checkpoint_path}, {e}")
+            return False
+    
+    async def _restore_training_state(self, state_data: Dict):
+        """
+        Restore training state from checkpoint metadata.
+        
+        Handles missing fields gracefully with sensible defaults.
+        """
+        # Core training progress
+        self.state.global_step = state_data.get("global_step", 0)
+        self.state.epoch = state_data.get("epoch", 0)
+        
+        # Loss tracking
+        self.state.current_loss = state_data.get("current_loss", float('inf'))
+        self.state.best_loss = state_data.get("best_loss", float('inf'))
+        
+        # Restore loss history
+        self.state.loss_history = state_data.get("loss_history", [])
+        if not self.state.loss_history and self.state.current_loss != float('inf'):
+            # If no history but we have current loss, initialize with it
+            self.state.loss_history = [self.state.current_loss]
+        
+        # Token and compute tracking
+        self.state.total_tokens_processed = state_data.get("total_tokens_processed", 0)
+        self.state.total_compute_hours = state_data.get("total_compute_hours", 0.0)
+        
+        # Improvement tracking
+        self.state.improvements = state_data.get("improvements", [])
+        self.state.last_improvement_step = state_data.get("last_improvement_step", 0)
+        
+        logger.info(
+            "Training state restored",
+            global_step=self.state.global_step,
+            epoch=self.state.epoch,
+            best_loss=self.state.best_loss,
+            improvements=len(self.state.improvements),
+            loss_history_len=len(self.state.loss_history)
+        )
+    
+    async def load_checkpoint(self, checkpoint_path: str) -> bool:
+        """
+        Manually load a specific checkpoint file.
+        
+        This is a public method for loading a specific checkpoint,
+        useful for resuming from a known good state.
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file to load
+            
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        logger.info(f"Manually loading checkpoint: {checkpoint_path}")
+        return await self._try_load_checkpoint(checkpoint_path)
+    
+    def get_available_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        Get list of available checkpoints with metadata.
+        
+        Returns:
+            List of checkpoint info dicts with path, step, timestamp, etc.
+        """
+        import os
+        import glob
+        
+        checkpoints = []
+        pattern = os.path.join(self.checkpoint_dir, "checkpoint_step_*.pt")
+        
+        for path in glob.glob(pattern):
+            try:
+                # Quick metadata extraction without full load
+                checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+                state = checkpoint.get("training_state", {})
+                
+                checkpoints.append({
+                    "path": path,
+                    "step": state.get("global_step", 0),
+                    "loss": state.get("current_loss", float('inf')),
+                    "best_loss": state.get("best_loss", float('inf')),
+                    "timestamp": checkpoint.get("timestamp", "unknown"),
+                    "model_id": checkpoint.get("model_id", "unknown"),
+                    "is_valid": self._validate_checkpoint_file(path)
+                })
+            except Exception as e:
+                checkpoints.append({
+                    "path": path,
+                    "step": 0,
+                    "loss": float('inf'),
+                    "timestamp": "unknown",
+                    "model_id": "unknown",
+                    "is_valid": False,
+                    "error": str(e)
+                })
+        
+        # Sort by step descending
+        checkpoints.sort(key=lambda x: x.get("step", 0), reverse=True)
+        
+        return checkpoints
     
     # =========================================================================
     # Evaluation & Tracking

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "demo-user",
+    "email": "demo@actuallyopenai.com",
+    "hashed_password": "588c55f3ce2b8569b153c5abbf13f9f74308b88a20017cc699b835cc93195d16",
+    "wallet_address": null,
+    "tier": "premium",
+    "created_at": "2026-01-14 01:56:10.682190",
+    "is_active": true,
+    "is_verified": true,
+    "api_key": null,
+    "usage_this_month": 0
+  },
+  {
+    "id": "aed0501a-4308-4d9e-a7c7-3c3c17b41dbf",
+    "email": "test@example.com",
+    "hashed_password": "724936cd9b665b34b178904d938970b9fffede7f6fcbae3e0f61b87170c06feb",
+    "wallet_address": "0x1234567890",
+    "tier": "free",
+    "created_at": "2026-01-14 01:56:10.686642",
+    "is_active": true,
+    "is_verified": false,
+    "api_key": null,
+    "usage_this_month": 0
+  }
+]

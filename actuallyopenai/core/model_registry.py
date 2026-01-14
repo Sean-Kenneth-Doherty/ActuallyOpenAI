@@ -1,8 +1,10 @@
 """
 Model Registry - Decentralized storage and management of trained AI models.
+Supports database persistence with in-memory cache fallback.
 """
 
 import hashlib
+import json
 import os
 from datetime import datetime
 from decimal import Decimal
@@ -11,6 +13,9 @@ import uuid
 
 import structlog
 from pydantic import BaseModel
+from sqlalchemy import select, update, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from actuallyopenai.config import get_settings
 from actuallyopenai.core.models import ModelInfo
@@ -29,23 +34,227 @@ class ModelVersion(BaseModel):
     changelog: str = ""
 
 
+class ModelVersionDB:
+    """Simple key-value store for model versions using JSON files."""
+    
+    def __init__(self, storage_path: str = "aoai_data/model_versions"):
+        self.storage_path = storage_path
+        os.makedirs(storage_path, exist_ok=True)
+    
+    def _get_file_path(self, model_id: str) -> str:
+        return os.path.join(self.storage_path, f"{model_id}_versions.json")
+    
+    def save_versions(self, model_id: str, versions: List[ModelVersion]):
+        """Save model versions to file."""
+        try:
+            file_path = self._get_file_path(model_id)
+            data = [v.dict() for v in versions]
+            # Convert datetime to ISO format for JSON serialization
+            for item in data:
+                if isinstance(item.get('created_at'), datetime):
+                    item['created_at'] = item['created_at'].isoformat()
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning("Failed to save model versions", model_id=model_id, error=str(e))
+    
+    def load_versions(self, model_id: str) -> List[ModelVersion]:
+        """Load model versions from file."""
+        try:
+            file_path = self._get_file_path(model_id)
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                return [ModelVersion(**item) for item in data]
+        except Exception as e:
+            logger.warning("Failed to load model versions", model_id=model_id, error=str(e))
+        return []
+
+
 class ModelRegistry:
     """
     Registry for managing trained AI models.
     Supports IPFS storage for decentralized model hosting.
+    Uses database persistence with in-memory cache fallback.
     """
     
-    def __init__(self, ipfs_host: str = None, ipfs_port: int = None):
+    def __init__(self, ipfs_host: str = None, ipfs_port: int = None, session_factory=None):
         settings = get_settings()
         self.ipfs_host = ipfs_host or settings.ipfs_host
         self.ipfs_port = ipfs_port or settings.ipfs_port
         
-        # In-memory registry (would be database in production)
+        # Database session factory (optional)
+        self._session_factory = session_factory
+        self._db_available = False
+        
+        # In-memory cache (used when DB unavailable or for speed)
         self.models: Dict[str, ModelInfo] = {}
         self.model_versions: Dict[str, List[ModelVersion]] = {}
         
+        # File-based version storage (fallback for versions)
+        self._version_storage = ModelVersionDB()
+        
         # IPFS client (lazy initialization)
         self._ipfs_client = None
+        
+        # Load cached data on init
+        self._load_from_cache()
+    
+    def _load_from_cache(self):
+        """Load models from local JSON cache on startup."""
+        cache_file = "aoai_data/model_registry_cache.json"
+        try:
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                for model_data in data.get('models', []):
+                    try:
+                        model = ModelInfo(**model_data)
+                        self.models[model.id] = model
+                        # Load versions for this model
+                        self.model_versions[model.id] = self._version_storage.load_versions(model.id)
+                    except Exception as e:
+                        logger.warning("Failed to load cached model", error=str(e))
+                logger.info("Loaded models from cache", count=len(self.models))
+        except Exception as e:
+            logger.warning("Failed to load model registry cache", error=str(e))
+    
+    def _save_to_cache(self):
+        """Save models to local JSON cache."""
+        cache_file = "aoai_data/model_registry_cache.json"
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            data = {
+                'models': [m.dict() for m in self.models.values()],
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            with open(cache_file, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning("Failed to save model registry cache", error=str(e))
+    
+    async def _get_db_session(self) -> Optional[AsyncSession]:
+        """Get database session if available."""
+        if self._session_factory:
+            try:
+                return self._session_factory()
+            except Exception as e:
+                logger.warning("Failed to create DB session", error=str(e))
+        return None
+    
+    async def _sync_to_database(self, model: ModelInfo):
+        """Sync model to database if available."""
+        session = await self._get_db_session()
+        if not session:
+            return
+        
+        try:
+            from actuallyopenai.core.database import ModelDB
+            
+            async with session.begin():
+                # Check if model exists
+                result = await session.execute(
+                    select(ModelDB).where(ModelDB.id == model.id)
+                )
+                existing = result.scalar_one_or_none()
+                
+                if existing:
+                    # Update existing model
+                    await session.execute(
+                        update(ModelDB).where(ModelDB.id == model.id).values(
+                            name=model.name,
+                            description=model.description,
+                            model_type=model.model_type,
+                            architecture=model.architecture,
+                            parameter_count=model.parameter_count,
+                            file_size_bytes=model.file_size_bytes,
+                            ipfs_hash=model.ipfs_hash,
+                            training_steps=model.training_steps,
+                            final_loss=model.final_loss,
+                            version=model.version,
+                            is_public=model.is_public,
+                            api_calls=model.api_calls,
+                            total_revenue=model.total_revenue,
+                            updated_at=datetime.utcnow()
+                        )
+                    )
+                else:
+                    # Insert new model
+                    db_model = ModelDB(
+                        id=model.id,
+                        name=model.name,
+                        description=model.description,
+                        model_type=model.model_type,
+                        architecture=model.architecture,
+                        parameter_count=model.parameter_count,
+                        file_size_bytes=model.file_size_bytes,
+                        ipfs_hash=model.ipfs_hash,
+                        training_steps=model.training_steps,
+                        final_loss=model.final_loss,
+                        version=model.version,
+                        is_public=model.is_public,
+                        api_calls=model.api_calls,
+                        total_revenue=model.total_revenue
+                    )
+                    session.add(db_model)
+            
+            self._db_available = True
+            logger.debug("Model synced to database", model_id=model.id)
+        except Exception as e:
+            self._db_available = False
+            logger.warning("Failed to sync model to database", model_id=model.id, error=str(e))
+        finally:
+            await session.close()
+    
+    async def _load_from_database(self):
+        """Load all models from database."""
+        session = await self._get_db_session()
+        if not session:
+            return
+        
+        try:
+            from actuallyopenai.core.database import ModelDB
+            
+            async with session.begin():
+                result = await session.execute(select(ModelDB))
+                db_models = result.scalars().all()
+                
+                for db_model in db_models:
+                    model = ModelInfo(
+                        id=db_model.id,
+                        name=db_model.name,
+                        description=db_model.description or "",
+                        model_type=db_model.model_type,
+                        architecture=db_model.architecture,
+                        parameter_count=db_model.parameter_count or 0,
+                        file_size_bytes=db_model.file_size_bytes or 0,
+                        ipfs_hash=db_model.ipfs_hash,
+                        training_steps=db_model.training_steps or 0,
+                        final_loss=db_model.final_loss,
+                        version=db_model.version or "1.0.0",
+                        is_public=db_model.is_public if db_model.is_public is not None else True,
+                        api_calls=db_model.api_calls or 0,
+                        total_revenue=db_model.total_revenue or Decimal("0"),
+                        created_at=db_model.created_at or datetime.utcnow(),
+                        updated_at=db_model.updated_at or datetime.utcnow()
+                    )
+                    self.models[model.id] = model
+                    # Load versions
+                    self.model_versions[model.id] = self._version_storage.load_versions(model.id)
+            
+            self._db_available = True
+            logger.info("Loaded models from database", count=len(db_models))
+            # Update local cache
+            self._save_to_cache()
+        except Exception as e:
+            self._db_available = False
+            logger.warning("Failed to load models from database", error=str(e))
+        finally:
+            await session.close()
+    
+    def set_session_factory(self, session_factory):
+        """Set the database session factory."""
+        self._session_factory = session_factory
     
     @property
     def ipfs_client(self):
@@ -92,6 +301,11 @@ class ModelRegistry:
         
         self.models[model.id] = model
         self.model_versions[model.id] = []
+        
+        # Persist to database
+        await self._sync_to_database(model)
+        # Save to local cache
+        self._save_to_cache()
         
         logger.info(
             "Model registered",
@@ -179,6 +393,11 @@ class ModelRegistry:
         if model_id not in self.model_versions:
             self.model_versions[model_id] = []
         self.model_versions[model_id].append(model_version)
+        
+        # Persist changes
+        await self._sync_to_database(model)
+        self._version_storage.save_versions(model_id, self.model_versions[model_id])
+        self._save_to_cache()
         
         logger.info(
             "Model version registered",
@@ -268,6 +487,10 @@ class ModelRegistry:
         if model_id in self.models:
             self.models[model_id].api_calls += 1
             self.models[model_id].total_revenue += revenue
+            # Periodically sync to database (every 100 calls)
+            if self.models[model_id].api_calls % 100 == 0:
+                await self._sync_to_database(self.models[model_id])
+                self._save_to_cache()
     
     async def get_model_stats(self, model_id: str) -> Dict[str, Any]:
         """Get statistics for a model."""
@@ -287,6 +510,41 @@ class ModelRegistry:
             "parameter_count": model.parameter_count,
             "training_steps": model.training_steps
         }
+    
+    async def delete_model(self, model_id: str) -> bool:
+        """Delete a model from the registry."""
+        if model_id not in self.models:
+            return False
+        
+        # Remove from memory
+        del self.models[model_id]
+        if model_id in self.model_versions:
+            del self.model_versions[model_id]
+        
+        # Remove from database if available
+        session = await self._get_db_session()
+        if session:
+            try:
+                from actuallyopenai.core.database import ModelDB
+                
+                async with session.begin():
+                    await session.execute(
+                        delete(ModelDB).where(ModelDB.id == model_id)
+                    )
+                logger.info("Model deleted from database", model_id=model_id)
+            except Exception as e:
+                logger.warning("Failed to delete model from database", model_id=model_id, error=str(e))
+            finally:
+                await session.close()
+        
+        # Update cache
+        self._save_to_cache()
+        
+        return True
+    
+    async def initialize(self):
+        """Initialize the registry - load from database if available."""
+        await self._load_from_database()
 
 
 # Global registry instance
@@ -298,4 +556,15 @@ def get_model_registry() -> ModelRegistry:
     global _registry
     if _registry is None:
         _registry = ModelRegistry()
+    return _registry
+
+
+async def initialize_model_registry(session_factory=None) -> ModelRegistry:
+    """Initialize the model registry with optional database support."""
+    global _registry
+    if _registry is None:
+        _registry = ModelRegistry(session_factory=session_factory)
+    elif session_factory:
+        _registry.set_session_factory(session_factory)
+    await _registry.initialize()
     return _registry

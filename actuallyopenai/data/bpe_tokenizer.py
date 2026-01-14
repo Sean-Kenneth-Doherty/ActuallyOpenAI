@@ -259,8 +259,8 @@ class BPETokenizer:
                 try:
                     byte_val = int(token[7:-2])
                     token = bytes([byte_val]).decode('utf-8', errors='replace')
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to decode byte token {token}: {e}")
             
             tokens.append(token)
         

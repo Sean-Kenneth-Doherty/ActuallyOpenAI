@@ -287,8 +287,8 @@ class IPFSModelStorage:
                 ) as response:
                     if response.status == 200:
                         return await response.read()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Local IPFS download failed for {cid}: {e}")
         return None
     
     async def _download_from_gateway(self, gateway: str, cid: str) -> Optional[bytes]:
@@ -339,8 +339,8 @@ class IPFSModelStorage:
                         meta = json.loads(meta_json.decode('utf-8'))
                         meta["cid"] = path.name
                         models.append(meta)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to read cached model {path.name}: {e}")
         return models
 
 

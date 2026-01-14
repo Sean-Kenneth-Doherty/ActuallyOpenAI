@@ -474,11 +474,11 @@ class TrainingOrchestrator:
     
     async def _broadcast(self, message: Dict):
         """Broadcast message to all connected workers."""
-        for ws in self.worker_connections.values():
+        for worker_id, ws in self.worker_connections.items():
             try:
                 await ws.send_json(message)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to broadcast to worker {worker_id}: {e}")
     
     # =========================================================================
     # Status & Metrics

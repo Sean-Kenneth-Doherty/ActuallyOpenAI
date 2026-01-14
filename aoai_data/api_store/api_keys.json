@@ -1,0 +1,12 @@
+[
+  {
+    "id": "demo-key",
+    "key_hash": "ce1ef60c3026bd6c0972968031214ee39c9576726ce4752e14c7d87805cec7a7",
+    "user_id": "demo-user",
+    "name": "Demo Key",
+    "created_at": "2026-01-14 01:56:10.682190",
+    "last_used": null,
+    "is_active": true,
+    "rate_limit": 1000
+  }
+]

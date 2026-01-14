@@ -22,6 +22,7 @@ from actuallyopenai.core.models import (
     ModelInfo, APIKey, InferenceRequest, InferenceResponse
 )
 from actuallyopenai.core.model_registry import get_model_registry, ModelRegistry
+from actuallyopenai.api.model_inference import get_inference
 
 logger = structlog.get_logger()
 
@@ -330,9 +331,18 @@ async def create_completion(
     
     start_time = time.time()
     
-    # TODO: Actual model inference would happen here
-    # For now, simulate response
-    generated_text = f"[Simulated response from {model.name}] This is a placeholder for actual model inference."
+    # Perform actual model inference
+    try:
+        inference_engine = get_inference()
+        generated_text = inference_engine.generate(
+            prompt=request.prompt,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+        )
+    except Exception as e:
+        logger.error("Inference failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
     
     # Calculate tokens (rough estimate)
     prompt_tokens = len(request.prompt.split()) * 2
@@ -409,10 +419,25 @@ async def create_chat_completion(
     if not model:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
     
-    # TODO: Actual chat inference
-    # Simulate response
-    last_message = messages[-1]["content"] if messages else ""
-    response_text = f"[{model.name}] I received your message about: {last_message[:50]}..."
+    # Build prompt from chat messages
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        prompt_parts.append(f"{role}: {content}")
+    prompt = "\n".join(prompt_parts) + "\nassistant:"
+    
+    # Perform actual model inference
+    try:
+        inference_engine = get_inference()
+        response_text = inference_engine.generate(
+            prompt=prompt,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+        )
+    except Exception as e:
+        logger.error("Chat inference failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
     
     # Calculate usage
     prompt_tokens = sum(len(m.get("content", "").split()) * 2 for m in messages)
@@ -429,22 +454,47 @@ async def create_chat_completion(
     
     if stream:
         async def generate():
-            """Stream response chunks."""
-            words = response_text.split()
-            for i, word in enumerate(words):
-                chunk = {
-                    "id": f"chatcmpl-{secrets.token_hex(12)}",
+            """Stream response chunks using real model inference."""
+            try:
+                inference_engine = get_inference()
+                stream_id = f"chatcmpl-{secrets.token_hex(12)}"
+                created = int(time.time())
+                
+                for token in inference_engine.generate_stream(
+                    prompt=prompt,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                ):
+                    chunk = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model.name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": token},
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {chunk}\n\n"
+                
+                # Send final chunk with finish_reason
+                final_chunk = {
+                    "id": stream_id,
                     "object": "chat.completion.chunk",
-                    "created": int(time.time()),
+                    "created": created,
                     "model": model.name,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": word + " "},
-                        "finish_reason": None if i < len(words) - 1 else "stop"
+                        "delta": {},
+                        "finish_reason": "stop"
                     }]
                 }
-                yield f"data: {chunk}\n\n"
-                await asyncio.sleep(0.05)
+                yield f"data: {final_chunk}\n\n"
+            except Exception as e:
+                logger.error("Stream inference failed", error=str(e))
+                error_chunk = {"error": str(e)}
+                yield f"data: {error_chunk}\n\n"
             yield "data: [DONE]\n\n"
         
         return StreamingResponse(

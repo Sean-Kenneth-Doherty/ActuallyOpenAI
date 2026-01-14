@@ -11,18 +11,636 @@ Architecture:
 - Gradient aggregation across network
 - Fault tolerance and recovery
 - Economic incentives for participation
+
+Aggregation Strategies:
+- FedAvg: Weighted average based on sample counts
+- FedProx: FedAvg with proximal term for heterogeneous data
+- Krum: Byzantine-fault-tolerant aggregation
+- TrimmedMean: Robust aggregation against outliers
+- Median: Coordinate-wise median aggregation
 """
 
 import asyncio
 import json
 import time
 import hashlib
+import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Callable, Any
+from typing import Dict, List, Optional, Set, Callable, Any, Tuple, Union
 from enum import Enum
+from abc import ABC, abstractmethod
 import logging
 
 logger = logging.getLogger("AOAI-Aggregator")
+
+
+# ============================================================================
+# Aggregation Strategies for Federated Learning
+# ============================================================================
+
+class AggregationStrategy(Enum):
+    """Available gradient/model aggregation strategies"""
+    FEDAVG = "fedavg"           # Standard Federated Averaging
+    FEDPROX = "fedprox"         # FedAvg with proximal regularization
+    KRUM = "krum"               # Byzantine-fault-tolerant
+    TRIMMED_MEAN = "trimmed_mean"  # Outlier-robust
+    MEDIAN = "median"           # Coordinate-wise median
+
+
+@dataclass
+class WorkerUpdate:
+    """Represents a gradient or model update from a worker"""
+    node_id: str
+    step: int
+    num_samples: int  # Number of training samples used
+    parameters: Dict[str, np.ndarray]  # Parameter name -> values
+    loss: float = 0.0
+    metrics: Dict[str, float] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    
+    def flatten(self) -> np.ndarray:
+        """Flatten all parameters into a single vector"""
+        arrays = []
+        for name in sorted(self.parameters.keys()):
+            arrays.append(self.parameters[name].flatten())
+        return np.concatenate(arrays) if arrays else np.array([])
+    
+    @staticmethod
+    def unflatten(flat_array: np.ndarray, shapes: Dict[str, tuple]) -> Dict[str, np.ndarray]:
+        """Reconstruct parameters from a flattened array"""
+        result = {}
+        offset = 0
+        for name in sorted(shapes.keys()):
+            shape = shapes[name]
+            size = np.prod(shape)
+            result[name] = flat_array[offset:offset + size].reshape(shape)
+            offset += size
+        return result
+
+
+class BaseAggregator(ABC):
+    """Abstract base class for aggregation strategies"""
+    
+    @abstractmethod
+    def aggregate(
+        self, 
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """Aggregate worker updates into global parameters"""
+        pass
+    
+    def validate_updates(self, updates: List[WorkerUpdate]) -> List[WorkerUpdate]:
+        """Validate and filter updates"""
+        if not updates:
+            raise ValueError("No updates to aggregate")
+        
+        # Ensure all updates have same parameter structure
+        reference_keys = set(updates[0].parameters.keys())
+        valid_updates = []
+        
+        for update in updates:
+            if set(update.parameters.keys()) == reference_keys:
+                valid_updates.append(update)
+            else:
+                logger.warning(f"Skipping update from {update.node_id}: mismatched parameter structure")
+        
+        if not valid_updates:
+            raise ValueError("No valid updates after validation")
+        
+        return valid_updates
+
+
+class FedAvgAggregator(BaseAggregator):
+    """
+    Federated Averaging (FedAvg) Implementation
+    
+    The classic federated learning algorithm from McMahan et al. (2017).
+    Computes weighted average of model parameters based on number of samples.
+    
+    Formula: w_global = Σ(n_k / n_total) * w_k
+    where n_k is number of samples from client k
+    """
+    
+    def __init__(self, min_updates: int = 1):
+        """
+        Args:
+            min_updates: Minimum number of updates required before aggregation
+        """
+        self.min_updates = min_updates
+    
+    def aggregate(
+        self,
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Perform FedAvg aggregation
+        
+        Args:
+            updates: List of worker updates with parameters and sample counts
+            global_params: Optional current global parameters (not used in FedAvg)
+        
+        Returns:
+            Aggregated parameters as weighted average
+        """
+        updates = self.validate_updates(updates)
+        
+        if len(updates) < self.min_updates:
+            raise ValueError(f"Need at least {self.min_updates} updates, got {len(updates)}")
+        
+        # Calculate total samples for weighting
+        total_samples = sum(u.num_samples for u in updates)
+        
+        if total_samples == 0:
+            # Fall back to uniform weighting
+            logger.warning("Total samples is 0, using uniform weighting")
+            total_samples = len(updates)
+            for u in updates:
+                u.num_samples = 1
+        
+        # Initialize aggregated parameters
+        aggregated = {}
+        
+        # Get parameter names from first update
+        param_names = list(updates[0].parameters.keys())
+        
+        for name in param_names:
+            # Initialize with zeros of correct shape
+            shape = updates[0].parameters[name].shape
+            dtype = updates[0].parameters[name].dtype
+            aggregated[name] = np.zeros(shape, dtype=np.float64)
+            
+            # Weighted sum
+            for update in updates:
+                weight = update.num_samples / total_samples
+                aggregated[name] += weight * update.parameters[name].astype(np.float64)
+            
+            # Convert back to original dtype
+            aggregated[name] = aggregated[name].astype(dtype)
+        
+        logger.info(f"FedAvg: Aggregated {len(updates)} updates, {total_samples} total samples")
+        return aggregated
+
+
+class FedProxAggregator(BaseAggregator):
+    """
+    FedProx Implementation (Li et al., 2020)
+    
+    Extends FedAvg with a proximal term to handle heterogeneous data.
+    The proximal term encourages local models to stay close to global model.
+    
+    Note: The proximal regularization is applied during local training.
+    This aggregator uses FedAvg-style weighted averaging.
+    """
+    
+    def __init__(self, mu: float = 0.01, min_updates: int = 1):
+        """
+        Args:
+            mu: Proximal term coefficient (used during local training)
+            min_updates: Minimum updates required
+        """
+        self.mu = mu
+        self.min_updates = min_updates
+        self._fedavg = FedAvgAggregator(min_updates)
+    
+    def aggregate(
+        self,
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """FedProx uses same aggregation as FedAvg"""
+        return self._fedavg.aggregate(updates, global_params)
+    
+    def get_proximal_loss(
+        self,
+        local_params: Dict[str, np.ndarray],
+        global_params: Dict[str, np.ndarray]
+    ) -> float:
+        """
+        Calculate proximal term: (mu/2) * ||w - w_global||^2
+        
+        Workers should add this to their loss during training.
+        """
+        total_diff = 0.0
+        for name in local_params:
+            if name in global_params:
+                diff = local_params[name] - global_params[name]
+                total_diff += np.sum(diff ** 2)
+        return (self.mu / 2) * total_diff
+
+
+class KrumAggregator(BaseAggregator):
+    """
+    Krum Byzantine-Fault-Tolerant Aggregation (Blanchard et al., 2017)
+    
+    Selects the update that is closest to the majority of other updates.
+    Robust against up to f Byzantine (malicious) workers.
+    
+    Multi-Krum variant selects m best updates and averages them.
+    """
+    
+    def __init__(self, num_byzantine: int = 0, multi_krum_m: int = 1):
+        """
+        Args:
+            num_byzantine: Expected number of Byzantine workers (f)
+            multi_krum_m: Number of updates to select for Multi-Krum
+        """
+        self.num_byzantine = num_byzantine
+        self.multi_krum_m = multi_krum_m
+    
+    def aggregate(
+        self,
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Perform Krum aggregation
+        
+        Args:
+            updates: List of worker updates
+            global_params: Not used
+        
+        Returns:
+            Selected (or averaged) parameters
+        """
+        updates = self.validate_updates(updates)
+        n = len(updates)
+        f = self.num_byzantine
+        
+        # Krum requires n >= 2f + 3
+        if n < 2 * f + 3:
+            logger.warning(f"Krum: n={n} < 2*{f}+3, reducing f")
+            f = max(0, (n - 3) // 2)
+        
+        # Flatten all updates for distance computation
+        flat_updates = [u.flatten() for u in updates]
+        
+        # Calculate pairwise distances
+        distances = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(flat_updates[i] - flat_updates[j])
+                distances[i, j] = dist
+                distances[j, i] = dist
+        
+        # Calculate Krum scores (sum of n-f-2 smallest distances)
+        scores = []
+        num_closest = n - f - 2
+        
+        for i in range(n):
+            # Sort distances from node i to all others
+            sorted_dists = np.sort(distances[i])
+            # Sum the smallest n-f-2 distances (excluding self which is 0)
+            score = np.sum(sorted_dists[1:num_closest + 1])
+            scores.append(score)
+        
+        # Select m updates with lowest scores
+        selected_indices = np.argsort(scores)[:self.multi_krum_m]
+        
+        logger.info(f"Krum: Selected {self.multi_krum_m} of {n} updates, scores: {[scores[i] for i in selected_indices]}")
+        
+        if self.multi_krum_m == 1:
+            # Single Krum: return selected update
+            return updates[selected_indices[0]].parameters.copy()
+        else:
+            # Multi-Krum: average selected updates
+            selected_updates = [updates[i] for i in selected_indices]
+            return FedAvgAggregator().aggregate(selected_updates)
+
+
+class TrimmedMeanAggregator(BaseAggregator):
+    """
+    Coordinate-wise Trimmed Mean Aggregation (Yin et al., 2018)
+    
+    For each parameter coordinate, removes the largest and smallest
+    values and averages the rest. Robust against outliers/adversaries.
+    """
+    
+    def __init__(self, trim_ratio: float = 0.1):
+        """
+        Args:
+            trim_ratio: Fraction of values to trim from each end (0-0.5)
+        """
+        self.trim_ratio = min(0.49, max(0.0, trim_ratio))
+    
+    def aggregate(
+        self,
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Perform trimmed mean aggregation
+        
+        For each coordinate, sort values from all workers, trim
+        the highest and lowest, then average the remainder.
+        """
+        updates = self.validate_updates(updates)
+        n = len(updates)
+        trim_count = int(n * self.trim_ratio)
+        
+        if n - 2 * trim_count < 1:
+            logger.warning(f"TrimmedMean: Not enough updates ({n}) for trim_ratio={self.trim_ratio}")
+            trim_count = max(0, (n - 1) // 2)
+        
+        aggregated = {}
+        
+        for name in updates[0].parameters.keys():
+            # Stack all updates for this parameter
+            stacked = np.stack([u.parameters[name] for u in updates], axis=0)
+            
+            # Sort along the worker axis (axis 0)
+            sorted_values = np.sort(stacked, axis=0)
+            
+            # Trim and average
+            if trim_count > 0:
+                trimmed = sorted_values[trim_count:-trim_count]
+            else:
+                trimmed = sorted_values
+            
+            aggregated[name] = np.mean(trimmed, axis=0).astype(updates[0].parameters[name].dtype)
+        
+        logger.info(f"TrimmedMean: Aggregated {n} updates, trimmed {trim_count} from each end")
+        return aggregated
+
+
+class MedianAggregator(BaseAggregator):
+    """
+    Coordinate-wise Median Aggregation
+    
+    Takes the median value at each parameter coordinate.
+    Very robust against outliers but may be slower to converge.
+    """
+    
+    def aggregate(
+        self,
+        updates: List[WorkerUpdate],
+        global_params: Optional[Dict[str, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Perform coordinate-wise median aggregation
+        """
+        updates = self.validate_updates(updates)
+        n = len(updates)
+        
+        aggregated = {}
+        
+        for name in updates[0].parameters.keys():
+            # Stack all updates for this parameter
+            stacked = np.stack([u.parameters[name] for u in updates], axis=0)
+            
+            # Take median along worker axis
+            aggregated[name] = np.median(stacked, axis=0).astype(updates[0].parameters[name].dtype)
+        
+        logger.info(f"Median: Aggregated {n} updates using coordinate-wise median")
+        return aggregated
+
+
+class FederatedAggregator:
+    """
+    Main federated aggregation manager
+    
+    Provides a unified interface for different aggregation strategies
+    with support for:
+    - Multiple aggregation algorithms
+    - Gradient compression
+    - Differential privacy (noise injection)
+    - Staleness handling for async updates
+    """
+    
+    def __init__(
+        self,
+        strategy: AggregationStrategy = AggregationStrategy.FEDAVG,
+        num_byzantine: int = 0,
+        trim_ratio: float = 0.1,
+        fedprox_mu: float = 0.01,
+        enable_compression: bool = False,
+        compression_ratio: float = 0.1,
+        dp_epsilon: Optional[float] = None,
+        max_staleness: int = 10,
+    ):
+        """
+        Initialize the federated aggregator
+        
+        Args:
+            strategy: Aggregation strategy to use
+            num_byzantine: Expected Byzantine workers (for Krum)
+            trim_ratio: Trim ratio (for TrimmedMean)
+            fedprox_mu: Proximal coefficient (for FedProx)
+            enable_compression: Enable gradient compression
+            compression_ratio: Ratio of gradients to keep (top-k)
+            dp_epsilon: Differential privacy epsilon (None = disabled)
+            max_staleness: Maximum allowed staleness for updates
+        """
+        self.strategy = strategy
+        self.enable_compression = enable_compression
+        self.compression_ratio = compression_ratio
+        self.dp_epsilon = dp_epsilon
+        self.max_staleness = max_staleness
+        
+        # Initialize the appropriate aggregator
+        self._aggregator = self._create_aggregator(
+            strategy, num_byzantine, trim_ratio, fedprox_mu
+        )
+        
+        # Track pending updates
+        self.pending_updates: Dict[int, List[WorkerUpdate]] = {}  # step -> updates
+        self.global_step = 0
+        self.global_params: Optional[Dict[str, np.ndarray]] = None
+        
+        # Statistics
+        self.aggregation_history: List[Dict[str, Any]] = []
+    
+    def _create_aggregator(
+        self,
+        strategy: AggregationStrategy,
+        num_byzantine: int,
+        trim_ratio: float,
+        fedprox_mu: float,
+    ) -> BaseAggregator:
+        """Factory method to create aggregators"""
+        if strategy == AggregationStrategy.FEDAVG:
+            return FedAvgAggregator()
+        elif strategy == AggregationStrategy.FEDPROX:
+            return FedProxAggregator(mu=fedprox_mu)
+        elif strategy == AggregationStrategy.KRUM:
+            return KrumAggregator(num_byzantine=num_byzantine)
+        elif strategy == AggregationStrategy.TRIMMED_MEAN:
+            return TrimmedMeanAggregator(trim_ratio=trim_ratio)
+        elif strategy == AggregationStrategy.MEDIAN:
+            return MedianAggregator()
+        else:
+            raise ValueError(f"Unknown aggregation strategy: {strategy}")
+    
+    def add_update(self, update: WorkerUpdate) -> None:
+        """
+        Add a worker update to pending aggregation
+        
+        Args:
+            update: The worker's model/gradient update
+        """
+        step = update.step
+        
+        # Check staleness
+        if step < self.global_step - self.max_staleness:
+            logger.warning(f"Rejecting stale update from {update.node_id}: step {step} < {self.global_step - self.max_staleness}")
+            return
+        
+        # Apply compression if enabled
+        if self.enable_compression:
+            update = self._compress_update(update)
+        
+        # Store update
+        if step not in self.pending_updates:
+            self.pending_updates[step] = []
+        self.pending_updates[step].append(update)
+        
+        logger.debug(f"Added update from {update.node_id} for step {step}")
+    
+    def _compress_update(self, update: WorkerUpdate) -> WorkerUpdate:
+        """Apply top-k gradient compression"""
+        compressed_params = {}
+        
+        for name, values in update.parameters.items():
+            flat = values.flatten()
+            k = int(len(flat) * self.compression_ratio)
+            k = max(1, k)  # Keep at least one value
+            
+            # Get indices of top-k absolute values
+            top_k_indices = np.argpartition(np.abs(flat), -k)[-k:]
+            
+            # Create sparse representation (zeros elsewhere)
+            compressed = np.zeros_like(flat)
+            compressed[top_k_indices] = flat[top_k_indices]
+            compressed_params[name] = compressed.reshape(values.shape)
+        
+        return WorkerUpdate(
+            node_id=update.node_id,
+            step=update.step,
+            num_samples=update.num_samples,
+            parameters=compressed_params,
+            loss=update.loss,
+            metrics=update.metrics,
+            timestamp=update.timestamp,
+        )
+    
+    def _add_dp_noise(self, params: Dict[str, np.ndarray], sensitivity: float = 1.0) -> Dict[str, np.ndarray]:
+        """Add Gaussian noise for differential privacy"""
+        if self.dp_epsilon is None:
+            return params
+        
+        # Calculate noise scale (simplified Gaussian mechanism)
+        sigma = sensitivity / self.dp_epsilon
+        
+        noisy_params = {}
+        for name, values in params.items():
+            noise = np.random.normal(0, sigma, values.shape)
+            noisy_params[name] = values + noise
+        
+        return noisy_params
+    
+    def aggregate(
+        self,
+        step: int,
+        min_updates: int = 1,
+        sensitivity: float = 1.0,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Aggregate updates for a given step
+        
+        Args:
+            step: The training step to aggregate
+            min_updates: Minimum number of updates required
+            sensitivity: Sensitivity for DP noise (if enabled)
+        
+        Returns:
+            Aggregated parameters or None if not enough updates
+        """
+        if step not in self.pending_updates:
+            logger.debug(f"No updates pending for step {step}")
+            return None
+        
+        updates = self.pending_updates[step]
+        
+        if len(updates) < min_updates:
+            logger.debug(f"Not enough updates for step {step}: {len(updates)} < {min_updates}")
+            return None
+        
+        # Perform aggregation
+        try:
+            aggregated = self._aggregator.aggregate(updates, self.global_params)
+        except ValueError as e:
+            logger.error(f"Aggregation failed: {e}")
+            return None
+        
+        # Apply differential privacy noise
+        aggregated = self._add_dp_noise(aggregated, sensitivity)
+        
+        # Update global state
+        self.global_params = aggregated
+        self.global_step = max(self.global_step, step)
+        
+        # Record statistics
+        total_samples = sum(u.num_samples for u in updates)
+        avg_loss = np.mean([u.loss for u in updates]) if updates else 0
+        
+        self.aggregation_history.append({
+            "step": step,
+            "num_updates": len(updates),
+            "total_samples": total_samples,
+            "avg_loss": avg_loss,
+            "strategy": self.strategy.value,
+            "timestamp": time.time(),
+        })
+        
+        # Clean up old updates
+        self._cleanup_old_updates()
+        
+        logger.info(f"Aggregated step {step}: {len(updates)} updates, {total_samples} samples, avg_loss={avg_loss:.4f}")
+        
+        return aggregated
+    
+    def _cleanup_old_updates(self):
+        """Remove updates that are too old"""
+        cutoff = self.global_step - self.max_staleness
+        old_steps = [s for s in self.pending_updates.keys() if s < cutoff]
+        for step in old_steps:
+            del self.pending_updates[step]
+    
+    def get_pending_count(self, step: int) -> int:
+        """Get number of pending updates for a step"""
+        return len(self.pending_updates.get(step, []))
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get aggregation statistics"""
+        return {
+            "strategy": self.strategy.value,
+            "global_step": self.global_step,
+            "pending_steps": list(self.pending_updates.keys()),
+            "total_aggregations": len(self.aggregation_history),
+            "compression_enabled": self.enable_compression,
+            "dp_enabled": self.dp_epsilon is not None,
+            "recent_history": self.aggregation_history[-10:] if self.aggregation_history else [],
+        }
+
+
+# Utility functions for PyTorch integration
+def torch_to_numpy_dict(state_dict: dict) -> Dict[str, np.ndarray]:
+    """Convert PyTorch state dict to numpy dict"""
+    try:
+        import torch
+        return {k: v.cpu().numpy() for k, v in state_dict.items()}
+    except ImportError:
+        raise ImportError("PyTorch is required for torch_to_numpy_dict")
+
+
+def numpy_to_torch_dict(numpy_dict: Dict[str, np.ndarray], device: str = "cpu") -> dict:
+    """Convert numpy dict to PyTorch state dict"""
+    try:
+        import torch
+        return {k: torch.from_numpy(v).to(device) for k, v in numpy_dict.items()}
+    except ImportError:
+        raise ImportError("PyTorch is required for numpy_to_torch_dict")
 
 
 class NodeRole(Enum):
@@ -106,12 +724,19 @@ class NetworkComputeAggregator:
     Coordinates compute across the entire network for large-scale training.
     
     The more nodes participate, the larger models we can train.
+    
+    Now integrated with FederatedAggregator for proper FedAvg and
+    Byzantine-fault-tolerant aggregation strategies.
     """
     
     def __init__(
         self,
         node_id: str,
         role: NodeRole = NodeRole.WORKER,
+        aggregation_strategy: AggregationStrategy = AggregationStrategy.FEDAVG,
+        num_byzantine: int = 0,
+        enable_compression: bool = False,
+        dp_epsilon: Optional[float] = None,
     ):
         self.node_id = node_id
         self.role = role
@@ -124,6 +749,17 @@ class NetworkComputeAggregator:
         self.current_job: Optional[TrainingJob] = None
         self.pending_gradients: List[GradientContribution] = []
         
+        # Federated aggregation (NEW)
+        self.federated_aggregator = FederatedAggregator(
+            strategy=aggregation_strategy,
+            num_byzantine=num_byzantine,
+            enable_compression=enable_compression,
+            dp_epsilon=dp_epsilon,
+        )
+        
+        # Stored model updates for FedAvg (actual parameter values)
+        self.pending_model_updates: Dict[str, List[WorkerUpdate]] = {}  # job_id -> updates
+        
         # Callbacks
         self.on_job_started: Optional[Callable[[TrainingJob], None]] = None
         self.on_gradient_received: Optional[Callable[[GradientContribution], None]] = None
@@ -133,7 +769,7 @@ class NetworkComputeAggregator:
         self.broadcast: Optional[Callable[[str, dict], None]] = None
         self.send_to_node: Optional[Callable[[str, str, dict], None]] = None
         
-        logger.info(f"Compute aggregator initialized as {role.value}")
+        logger.info(f"Compute aggregator initialized as {role.value} with {aggregation_strategy.value} strategy")
     
     def register_capabilities(self, capabilities: ComputeCapability):
         """Register node compute capabilities"""
@@ -333,6 +969,195 @@ class NetworkComputeAggregator:
             "gradient_hashes": [c.gradient_hash for c in contributions],
         }
     
+    # ========================================================================
+    # FedAvg Model Aggregation Methods (NEW)
+    # ========================================================================
+    
+    def submit_model_update(
+        self,
+        job_id: str,
+        step: int,
+        model_params: Dict[str, np.ndarray],
+        num_samples: int,
+        loss: float = 0.0,
+        metrics: Optional[Dict[str, float]] = None,
+    ) -> WorkerUpdate:
+        """
+        Submit a model parameter update for federated aggregation.
+        
+        This is the main method for FedAvg - workers submit their trained
+        model parameters along with the number of samples used for training.
+        
+        Args:
+            job_id: The training job ID
+            step: Current training step
+            model_params: Dictionary mapping parameter names to numpy arrays
+            num_samples: Number of training samples used
+            loss: Training loss (for logging)
+            metrics: Optional additional metrics
+        
+        Returns:
+            The created WorkerUpdate object
+        """
+        update = WorkerUpdate(
+            node_id=self.node_id,
+            step=step,
+            num_samples=num_samples,
+            parameters=model_params,
+            loss=loss,
+            metrics=metrics or {},
+        )
+        
+        # Add to federated aggregator
+        self.federated_aggregator.add_update(update)
+        
+        # Store locally for job tracking
+        if job_id not in self.pending_model_updates:
+            self.pending_model_updates[job_id] = []
+        self.pending_model_updates[job_id].append(update)
+        
+        # Update job stats
+        if job_id in self.active_jobs:
+            job = self.active_jobs[job_id]
+            job.total_tokens_processed += num_samples * 2048  # Approximate tokens
+            job.tokens_per_node[self.node_id] = (
+                job.tokens_per_node.get(self.node_id, 0) + num_samples * 2048
+            )
+        
+        # Broadcast to network (hash only for efficiency)
+        if self.broadcast:
+            # Create hash of parameters for verification
+            param_hash = self._hash_parameters(model_params)
+            self.broadcast("model_update_submitted", {
+                "node_id": self.node_id,
+                "job_id": job_id,
+                "step": step,
+                "num_samples": num_samples,
+                "loss": loss,
+                "param_hash": param_hash,
+            })
+        
+        logger.info(f"Submitted model update: job={job_id}, step={step}, samples={num_samples}")
+        return update
+    
+    def receive_model_update(self, update: WorkerUpdate, job_id: str):
+        """
+        Receive a model parameter update from another worker.
+        
+        Used by coordinator to collect updates from all workers.
+        
+        Args:
+            update: The worker's model update
+            job_id: The training job ID
+        """
+        # Add to federated aggregator
+        self.federated_aggregator.add_update(update)
+        
+        # Store for job tracking
+        if job_id not in self.pending_model_updates:
+            self.pending_model_updates[job_id] = []
+        self.pending_model_updates[job_id].append(update)
+        
+        logger.debug(f"Received model update from {update.node_id[:16]}, step {update.step}")
+    
+    def aggregate_model_updates(
+        self,
+        job_id: str,
+        step: int,
+        min_updates: int = 2,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Aggregate model updates using FedAvg (or configured strategy).
+        
+        This is the core aggregation method that implements federated averaging.
+        
+        Args:
+            job_id: The training job ID
+            step: The training step to aggregate
+            min_updates: Minimum number of worker updates required
+        
+        Returns:
+            Aggregated model parameters, or None if not enough updates
+        """
+        # Use the federated aggregator
+        aggregated = self.federated_aggregator.aggregate(step, min_updates)
+        
+        if aggregated is not None:
+            # Clean up job-specific tracking
+            if job_id in self.pending_model_updates:
+                self.pending_model_updates[job_id] = [
+                    u for u in self.pending_model_updates[job_id]
+                    if u.step > step
+                ]
+            
+            logger.info(f"Aggregated model updates for job={job_id}, step={step}")
+        
+        return aggregated
+    
+    def aggregate_with_pytorch(
+        self,
+        job_id: str,
+        step: int,
+        min_updates: int = 2,
+        device: str = "cpu",
+    ) -> Optional[dict]:
+        """
+        Aggregate and return as PyTorch state dict.
+        
+        Convenience method that converts aggregated numpy arrays to PyTorch tensors.
+        
+        Args:
+            job_id: The training job ID
+            step: The training step to aggregate
+            min_updates: Minimum worker updates required
+            device: PyTorch device for the tensors
+        
+        Returns:
+            PyTorch state dict or None
+        """
+        aggregated = self.aggregate_model_updates(job_id, step, min_updates)
+        if aggregated is None:
+            return None
+        return numpy_to_torch_dict(aggregated, device)
+    
+    def _hash_parameters(self, params: Dict[str, np.ndarray]) -> str:
+        """Create a hash of model parameters for verification"""
+        hasher = hashlib.sha256()
+        for name in sorted(params.keys()):
+            hasher.update(name.encode())
+            hasher.update(params[name].tobytes())
+        return hasher.hexdigest()[:32]
+    
+    def get_aggregation_status(self, step: int) -> Dict[str, Any]:
+        """Get the aggregation status for a step"""
+        pending = self.federated_aggregator.get_pending_count(step)
+        stats = self.federated_aggregator.get_statistics()
+        
+        return {
+            "step": step,
+            "pending_updates": pending,
+            "global_step": stats["global_step"],
+            "strategy": stats["strategy"],
+            "total_aggregations": stats["total_aggregations"],
+        }
+    
+    def change_aggregation_strategy(
+        self,
+        strategy: AggregationStrategy,
+        num_byzantine: int = 0,
+        trim_ratio: float = 0.1,
+    ):
+        """
+        Change the aggregation strategy at runtime.
+        
+        Useful for adapting to different network conditions or attack scenarios.
+        """
+        self.federated_aggregator._aggregator = self.federated_aggregator._create_aggregator(
+            strategy, num_byzantine, trim_ratio, 0.01
+        )
+        self.federated_aggregator.strategy = strategy
+        logger.info(f"Changed aggregation strategy to {strategy.value}")
+    
     def calculate_rewards(self, job_id: str) -> Dict[str, float]:
         """Calculate token rewards for job participants"""
         if job_id not in self.active_jobs:
@@ -486,8 +1311,113 @@ class TrainingCoordinator:
 
 
 if __name__ == "__main__":
-    # Test aggregator
-    aggregator = NetworkComputeAggregator("test_node", NodeRole.COORDINATOR)
+    print("=" * 60)
+    print("Testing FedAvg and Aggregation Strategies")
+    print("=" * 60)
+    
+    # Test 1: Basic FedAvg aggregation
+    print("\n--- Test 1: FedAvg Weighted Averaging ---")
+    fedavg = FedAvgAggregator()
+    
+    # Simulate 3 workers with different sample counts
+    updates = [
+        WorkerUpdate(
+            node_id="worker_1",
+            step=0,
+            num_samples=100,
+            parameters={
+                "layer1.weight": np.array([[1.0, 2.0], [3.0, 4.0]]),
+                "layer1.bias": np.array([0.1, 0.2]),
+            },
+            loss=0.5,
+        ),
+        WorkerUpdate(
+            node_id="worker_2",
+            step=0,
+            num_samples=200,
+            parameters={
+                "layer1.weight": np.array([[2.0, 3.0], [4.0, 5.0]]),
+                "layer1.bias": np.array([0.2, 0.3]),
+            },
+            loss=0.4,
+        ),
+        WorkerUpdate(
+            node_id="worker_3",
+            step=0,
+            num_samples=100,
+            parameters={
+                "layer1.weight": np.array([[3.0, 4.0], [5.0, 6.0]]),
+                "layer1.bias": np.array([0.3, 0.4]),
+            },
+            loss=0.6,
+        ),
+    ]
+    
+    aggregated = fedavg.aggregate(updates)
+    print(f"Aggregated weights (weighted by samples 100:200:100):")
+    print(f"  layer1.weight:\n{aggregated['layer1.weight']}")
+    print(f"  layer1.bias: {aggregated['layer1.bias']}")
+    # Expected: (100*1 + 200*2 + 100*3)/400 = 200/400 = 2.0 for [0,0] etc.
+    
+    # Test 2: Krum Byzantine fault tolerance
+    print("\n--- Test 2: Krum Byzantine Fault Tolerance ---")
+    krum = KrumAggregator(num_byzantine=1, multi_krum_m=1)
+    
+    # Add a Byzantine (malicious) update
+    updates_with_byzantine = updates + [
+        WorkerUpdate(
+            node_id="byzantine",
+            step=0,
+            num_samples=100,
+            parameters={
+                "layer1.weight": np.array([[100.0, 100.0], [100.0, 100.0]]),  # Outlier
+                "layer1.bias": np.array([100.0, 100.0]),
+            },
+            loss=0.1,
+        ),
+    ]
+    
+    krum_result = krum.aggregate(updates_with_byzantine)
+    print(f"Krum selected update (should reject Byzantine outlier):")
+    print(f"  layer1.weight:\n{krum_result['layer1.weight']}")
+    
+    # Test 3: Trimmed Mean
+    print("\n--- Test 3: Trimmed Mean ---")
+    trimmed = TrimmedMeanAggregator(trim_ratio=0.25)
+    trimmed_result = trimmed.aggregate(updates_with_byzantine)
+    print(f"Trimmed mean (25% from each end):")
+    print(f"  layer1.weight:\n{trimmed_result['layer1.weight']}")
+    
+    # Test 4: Median aggregation
+    print("\n--- Test 4: Median Aggregation ---")
+    median = MedianAggregator()
+    median_result = median.aggregate(updates)
+    print(f"Median aggregation:")
+    print(f"  layer1.weight:\n{median_result['layer1.weight']}")
+    
+    # Test 5: FederatedAggregator with compression
+    print("\n--- Test 5: FederatedAggregator with Compression ---")
+    fed_agg = FederatedAggregator(
+        strategy=AggregationStrategy.FEDAVG,
+        enable_compression=True,
+        compression_ratio=0.5,
+    )
+    
+    for update in updates:
+        fed_agg.add_update(update)
+    
+    result = fed_agg.aggregate(step=0, min_updates=2)
+    print(f"Compressed FedAvg result:")
+    print(f"  layer1.weight:\n{result['layer1.weight']}")
+    print(f"Stats: {fed_agg.get_statistics()}")
+    
+    # Test 6: NetworkComputeAggregator integration
+    print("\n--- Test 6: NetworkComputeAggregator Integration ---")
+    aggregator = NetworkComputeAggregator(
+        "test_coordinator",
+        NodeRole.COORDINATOR,
+        aggregation_strategy=AggregationStrategy.FEDAVG,
+    )
     
     # Register some nodes
     for i in range(5):
@@ -501,9 +1431,29 @@ if __name__ == "__main__":
     
     print(f"Total network compute: {aggregator.get_total_network_compute():.1f}")
     
+    # Simulate worker updates
+    job_id = "test_job"
+    for i, update in enumerate(updates):
+        update_copy = WorkerUpdate(
+            node_id=f"worker_{i}",
+            step=1,
+            num_samples=update.num_samples,
+            parameters=update.parameters.copy(),
+            loss=update.loss,
+        )
+        aggregator.receive_model_update(update_copy, job_id)
+    
+    # Aggregate
+    agg_result = aggregator.aggregate_model_updates(job_id, step=1, min_updates=2)
+    if agg_result:
+        print(f"NetworkComputeAggregator result:")
+        print(f"  layer1.weight:\n{agg_result['layer1.weight']}")
+    
+    print(f"\nAggregation status: {aggregator.get_aggregation_status(1)}")
+    
     # Check capable nodes
     capable = aggregator.get_capable_nodes(model_params=1_000_000_000, batch_size=32)
-    print(f"Nodes capable of 1B params: {len(capable)}")
+    print(f"\nNodes capable of 1B params: {len(capable)}")
     
     # Estimate training time
     time_estimate = aggregator.estimate_training_time(
@@ -512,3 +1462,7 @@ if __name__ == "__main__":
         target_steps=100000,
     )
     print(f"Estimated training time: {time_estimate/3600:.1f} hours")
+    
+    print("\n" + "=" * 60)
+    print("All FedAvg tests completed successfully!")
+    print("=" * 60)

@@ -211,8 +211,8 @@ class ModelInference:
                     token_text = self.tokenizer.decode([next_token.item()])
                     if token_text:
                         yield token_text
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to decode token {next_token.item()}: {e}")
                 
                 if next_token.item() == 0 or next_token.item() == 255:
                     break

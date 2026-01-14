@@ -30,25 +30,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def print_banner():
     """Print the ActuallyOpenAI banner."""
     banner = """
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                                                               ║
-    ║     █████╗  ██████╗████████╗██╗   ██╗ █████╗ ██╗     ██╗  ██╗ ║
-    ║    ██╔══██╗██╔════╝╚══██╔══╝██║   ██║██╔══██╗██║     ██║  ╚██╗║
-    ║    ███████║██║        ██║   ██║   ██║███████║██║     ██║   ██║║
-    ║    ██╔══██║██║        ██║   ██║   ██║██╔══██║██║     ██║   ██║║
-    ║    ██║  ██║╚██████╗   ██║   ╚██████╔╝██║  ██║███████╗███████╔╝║
-    ║    ╚═╝  ╚═╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝ ║
-    ║                                                               ║
-    ║         ██████╗ ██████╗ ███████╗███╗   ██╗ █████╗ ██╗         ║
-    ║        ██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔══██╗██║         ║
-    ║        ██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████║██║         ║
-    ║        ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██╔══██║██║         ║
-    ║        ╚██████╔╝██║     ███████╗██║ ╚████║██║  ██║██║         ║
-    ║         ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝         ║
-    ║                                                               ║
-    ║              🧠  LOCAL TRAINING DEMONSTRATION  🧠              ║
-    ║                                                               ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    ================================================================
+                    ACTUALLYOPENAI
+                LOCAL TRAINING DEMONSTRATION
+    ================================================================
     """
     print(banner)
 
@@ -76,7 +61,7 @@ class SimpleTextDataset(Dataset):
         # Calculate number of sequences
         self.num_sequences = (len(self.all_tokens) - 1) // seq_length
         
-        print(f"📚 Dataset: {len(self.all_tokens):,} tokens -> {self.num_sequences:,} sequences")
+        print(f"[Dataset] {len(self.all_tokens):,} tokens -> {self.num_sequences:,} sequences")
     
     def __len__(self):
         return max(1, self.num_sequences)
@@ -285,19 +270,19 @@ def main():
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n🖥️  Using device: {device}")
+    print(f"\n[*] Using device: {device}")
     if device == "cuda":
         print(f"   GPU: {torch.cuda.get_device_name()}")
     
     # Import our modules
-    print("\n📦 Loading ActuallyOpenAI modules...")
+    print("\n[*] Loading ActuallyOpenAI modules...")
     
     try:
         from actuallyopenai.models.base_model import create_model
         from actuallyopenai.data.tokenizer import BPETokenizer, SimpleByteTokenizer
-        print("   ✅ Modules loaded successfully!")
+        print("   [OK] Modules loaded successfully!")
     except ImportError as e:
-        print(f"   ❌ Import error: {e}")
+        print(f"   [X] Import error: {e}")
         print("   Creating minimal training setup...")
         
         # Fallback: create model directly
@@ -341,10 +326,10 @@ def main():
         
         model = MinimalTransformer().to(device)
         tokenizer = SimpleTokenizer()
-        print("   ✅ Created minimal transformer model")
+        print("   [OK] Created minimal transformer model")
     else:
         # Use our full model
-        print("\n🏗️  Creating model...")
+        print("\n[*] Creating model...")
         
         # Create tokenizer (260 vocab size - 256 bytes + 4 special tokens)
         tokenizer = SimpleByteTokenizer()
@@ -360,7 +345,7 @@ def main():
         print(f"   Vocab size: {tokenizer.vocab_size}")
     
     # Get training data
-    print("\n📚 Preparing training data...")
+    print("\n[*] Preparing training data...")
     texts = get_demo_training_data()
     print(f"   Loaded {len(texts)} text samples")
     
@@ -376,7 +361,7 @@ def main():
     
     # Test generation BEFORE training
     print("\n" + "=" * 60)
-    print("🔴 BEFORE TRAINING - Model outputs random tokens:")
+    print("[BEFORE TRAINING] - Model outputs random tokens:")
     print("=" * 60)
     
     test_prompts = [
@@ -392,7 +377,7 @@ def main():
     
     # Train!
     print("\n" + "=" * 60)
-    print("🚀 TRAINING - Watch the model learn!")
+    print("[TRAINING] - Watch the model learn!")
     print("=" * 60)
     
     start_time = time.time()
@@ -403,11 +388,11 @@ def main():
         losses.append(loss)
         
         perplexity = torch.exp(torch.tensor(loss)).item()
-        print(f"\n  ✓ Epoch {epoch} complete - Avg Loss: {loss:.4f} | Perplexity: {perplexity:.2f}")
+        print(f"\n  [OK] Epoch {epoch} complete - Avg Loss: {loss:.4f} | Perplexity: {perplexity:.2f}")
         
         # Generate sample every few epochs
         if epoch % 3 == 0:
-            print(f"\n  📝 Sample generation at epoch {epoch}:")
+            print(f"\n  [Sample] Sample generation at epoch {epoch}:")
             sample = generate_text(model, tokenizer, "The sun is", max_tokens=30, device=device)
             print(f"     '{sample}'")
     
@@ -415,7 +400,7 @@ def main():
     
     # Test generation AFTER training
     print("\n" + "=" * 60)
-    print("🟢 AFTER TRAINING - Model has learned patterns!")
+    print("[AFTER TRAINING] - Model has learned patterns!")
     print("=" * 60)
     
     for prompt in test_prompts:
@@ -425,7 +410,7 @@ def main():
     
     # Print summary
     print("\n" + "=" * 60)
-    print("📊 TRAINING SUMMARY")
+    print("[TRAINING SUMMARY]")
     print("=" * 60)
     print(f"   Total training time: {training_time:.1f} seconds")
     print(f"   Epochs completed: {num_epochs}")
@@ -445,10 +430,10 @@ def main():
         "losses": losses,
         "epochs": num_epochs
     }, save_path)
-    print(f"\n💾 Model saved to: {save_path}")
+    print(f"\n[*] Model saved to: {save_path}")
     
     print("\n" + "=" * 60)
-    print("✅ TRAINING COMPLETE!")
+    print("[OK] TRAINING COMPLETE!")
     print("=" * 60)
     print("""
     The model has learned:
@@ -460,7 +445,7 @@ def main():
     This is a REAL LLM that has been trained on actual data!
     Scale it up with more data and compute to make it smarter.
     
-    🌐 In the full distributed system:
+    In the full distributed system:
        - Workers contribute compute
        - Training happens across the globe  
        - AOAI tokens reward contributors

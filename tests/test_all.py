@@ -8,6 +8,12 @@ Comprehensive tests for:
 - Worker operations
 """
 
+import sys
+import os
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import pytest
 from datetime import datetime

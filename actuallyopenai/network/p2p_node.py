@@ -151,10 +151,27 @@ class P2PNode:
         # Token balance (local tracking - verified on chain)
         self.token_balance: float = 0.0
         
+        # Gradient aggregation for distributed training
+        self.gradient_buffer: Dict[str, List[dict]] = {}  # work_id -> list of gradients
+        self.gradient_counts: Dict[str, int] = {}  # work_id -> expected count
+        self.aggregated_gradients: Dict[str, dict] = {}  # work_id -> aggregated result
+        
+        # Model synchronization state
+        self.current_model_version: str = "0.0.0"
+        self.model_state: Optional[dict] = None
+        self.pending_model_syncs: Dict[str, dict] = {}  # node_id -> model state
+        
+        # Token transfer tracking
+        self.pending_transfers: Dict[str, dict] = {}  # transfer_id -> transfer details
+        self.transfer_history: List[dict] = []
+        
         # Callbacks
         self.on_peer_connected: Optional[Callable] = None
         self.on_work_received: Optional[Callable] = None
         self.on_tokens_earned: Optional[Callable] = None
+        self.on_gradient_received: Optional[Callable] = None
+        self.on_model_sync: Optional[Callable] = None
+        self.on_gradients_aggregated: Optional[Callable] = None
         
         logger.info(f"🌐 P2P Node initialized: {self.node_id[:16]}...")
     
@@ -176,6 +193,9 @@ class P2PNode:
         self.handlers[MessageType.WORK_RESPONSE] = self._handle_work_response
         self.handlers[MessageType.HEARTBEAT] = self._handle_heartbeat
         self.handlers[MessageType.ANNOUNCE] = self._handle_announce
+        self.handlers[MessageType.GRADIENT_SHARE] = self._handle_gradient_share
+        self.handlers[MessageType.MODEL_SYNC] = self._handle_model_sync
+        self.handlers[MessageType.TOKEN_TRANSFER] = self._handle_token_transfer
     
     async def start(self):
         """Start the P2P node"""
@@ -250,8 +270,8 @@ class P2PNode:
                 try:
                     loop = asyncio.get_event_loop()
                     await loop.sock_sendall(client, response.serialize())
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Failed to send response to {addr}: {e}")
     
     async def _bootstrap(self):
         """Bootstrap into the network by connecting to known nodes"""
@@ -375,8 +395,8 @@ class P2PNode:
             )
             
             await loop.sock_sendall(sock, discover.serialize())
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to request peers: {e}")
     
     async def _heartbeat_loop(self):
         """Send periodic heartbeats to all peers"""
@@ -393,8 +413,9 @@ class P2PNode:
                             "work_completed": len(self.completed_work)
                         }
                     ))
-                except:
+                except Exception as e:
                     # Mark peer as inactive if heartbeat fails
+                    logger.debug(f"Heartbeat failed for peer {peer_id[:16]}...: {e}")
                     peer.is_active = False
     
     async def _peer_maintenance(self):
@@ -435,8 +456,8 @@ class P2PNode:
                 props = torch.cuda.get_device_properties(0)
                 # Rough TFLOPS estimate
                 return (props.multi_processor_count * props.max_threads_per_multi_processor * 2) / 1e12
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Could not estimate GPU compute power: {e}")
         return 0.1  # Default CPU estimate
     
     async def _broadcast(self, message: Message):
@@ -444,8 +465,8 @@ class P2PNode:
         for peer_id, peer in list(self.peers.items()):
             try:
                 await self._send_to_peer(peer, message)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Broadcast to peer {peer_id[:16]}... failed: {e}")
     
     async def _send_to_peer(self, peer: Peer, message: Message):
         """Send message to specific peer"""
@@ -475,9 +496,41 @@ class P2PNode:
             }
         )
     
-    async def _handle_pong(self, message: Message, addr: tuple):
+    async def _handle_pong(self, message: Message, addr: tuple) -> Optional[Message]:
         """Handle PONG message"""
-        pass  # Handled in _connect_to_peer
+        try:
+            sender_id = message.sender_id
+            
+            # Update peer info if we already know them
+            if sender_id in self.peers:
+                peer = self.peers[sender_id]
+                peer.last_seen = time.time()
+                peer.compute_power = message.payload.get("compute_power", peer.compute_power)
+                peer.is_active = True
+                logger.debug(f"Updated peer info for {sender_id[:16]}...")
+            else:
+                # New peer responding to our ping - add them
+                compute_power = message.payload.get("compute_power", 1.0)
+                port = message.payload.get("port", addr[1])
+                
+                peer = Peer(
+                    node_id=sender_id,
+                    host=addr[0],
+                    port=port,
+                    compute_power=compute_power
+                )
+                self.peers[sender_id] = peer
+                self.known_peers.add((addr[0], port))
+                
+                logger.info(f"✅ Peer added from PONG: {sender_id[:16]}... ({addr[0]}:{port})")
+                
+                if self.on_peer_connected:
+                    self.on_peer_connected(peer)
+            
+        except Exception as e:
+            logger.error(f"Error handling PONG from {addr}: {e}")
+        
+        return None  # PONG is a response, no further reply needed
     
     async def _handle_discover(self, message: Message, addr: tuple) -> Message:
         """Handle peer discovery request"""
@@ -517,22 +570,503 @@ class P2PNode:
             )
         return None
     
-    async def _handle_work_response(self, message: Message, addr: tuple):
-        """Handle work response"""
-        work_id = message.payload.get("work_id")
-        if work_id:
-            self.completed_work[work_id] = message.payload
+    async def _handle_work_response(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle work response from a peer that completed assigned work"""
+        try:
+            work_id = message.payload.get("work_id")
+            sender_id = message.sender_id
+            result = message.payload.get("result")
+            execution_time = message.payload.get("execution_time", 0)
+            success = message.payload.get("success", True)
+            
+            if not work_id:
+                logger.warning(f"Work response from {sender_id[:16]}... missing work_id")
+                return None
+            
+            # Store completed work
+            self.completed_work[work_id] = {
+                "work_id": work_id,
+                "result": result,
+                "sender_id": sender_id,
+                "execution_time": execution_time,
+                "success": success,
+                "completed_at": time.time()
+            }
+            
+            logger.info(f"📥 Work {work_id[:8]}... completed by {sender_id[:16]}... (took {execution_time:.2f}s)")
+            
+            # Update peer reputation based on successful completion
+            if sender_id in self.peers:
+                peer = self.peers[sender_id]
+                if success:
+                    # Increase reputation for successful work
+                    peer.reputation = min(2.0, peer.reputation + 0.01)
+                    peer.tokens_earned += message.payload.get("tokens_earned", 0)
+                else:
+                    # Decrease reputation for failed work
+                    peer.reputation = max(0.1, peer.reputation - 0.05)
+                    logger.warning(f"Work {work_id[:8]}... failed by peer {sender_id[:16]}...")
+            
+            # Check if this is part of a distributed training job
+            if "gradients" in message.payload:
+                await self._handle_gradient_share(message, addr)
+            
+        except Exception as e:
+            logger.error(f"Error handling work response from {addr}: {e}")
+        
+        return None
     
-    async def _handle_heartbeat(self, message: Message, addr: tuple):
-        """Handle heartbeat"""
-        sender_id = message.sender_id
-        if sender_id in self.peers:
-            self.peers[sender_id].last_seen = time.time()
+    async def _handle_heartbeat(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle heartbeat - update peer status and optionally respond with our status"""
+        try:
+            sender_id = message.sender_id
+            
+            if sender_id in self.peers:
+                peer = self.peers[sender_id]
+                peer.last_seen = time.time()
+                peer.is_active = True
+                
+                # Update peer stats from heartbeat payload
+                peer.tokens_earned = message.payload.get("tokens", peer.tokens_earned)
+                peer.compute_power = message.payload.get("compute_power", peer.compute_power)
+                
+                # Track peer's work history
+                work_completed = message.payload.get("work_completed", 0)
+                pending_work = message.payload.get("pending_work", 0)
+                
+                logger.debug(
+                    f"💓 Heartbeat from {sender_id[:16]}...: "
+                    f"tokens={peer.tokens_earned:.2f}, "
+                    f"compute={peer.compute_power:.2f} TFLOPS, "
+                    f"work={work_completed} done/{pending_work} pending"
+                )
+            else:
+                # Unknown peer sending heartbeat - try to add them
+                port = message.payload.get("port", addr[1])
+                logger.info(f"Heartbeat from unknown peer {sender_id[:16]}..., attempting connection")
+                asyncio.create_task(self._connect_to_peer(addr[0], port))
+            
+        except Exception as e:
+            logger.error(f"Error handling heartbeat from {addr}: {e}")
+        
+        return None  # Heartbeats don't require a response
     
-    async def _handle_announce(self, message: Message, addr: tuple):
-        """Handle node announcement"""
-        port = message.payload.get("port", 31337)
-        await self._connect_to_peer(addr[0], port)
+    async def _handle_announce(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle node announcement - add new peer and propagate to network"""
+        try:
+            sender_id = message.sender_id
+            port = message.payload.get("port", 31337)
+            compute_power = message.payload.get("compute_power", 1.0)
+            version = message.payload.get("version", "unknown")
+            capabilities = message.payload.get("capabilities", [])
+            
+            # Don't process our own announcements
+            if sender_id == self.node_id:
+                return None
+            
+            # Check if this is a new peer
+            is_new_peer = sender_id not in self.peers
+            
+            if is_new_peer:
+                logger.info(
+                    f"📢 New node announced: {sender_id[:16]}... "
+                    f"({addr[0]}:{port}) - {compute_power:.2f} TFLOPS, v{version}"
+                )
+                
+                # Try to connect to the new peer
+                await self._connect_to_peer(addr[0], port)
+                
+                # Gossip: Forward announcement to our other peers (limited propagation)
+                # Only forward to a subset of peers to prevent network flooding
+                forward_count = min(3, len(self.peers))
+                peers_to_notify = random.sample(
+                    list(self.peers.values()),
+                    forward_count
+                ) if len(self.peers) >= forward_count else list(self.peers.values())
+                
+                for peer in peers_to_notify:
+                    if peer.node_id != sender_id:  # Don't send back to sender
+                        try:
+                            await self._send_to_peer(peer, message)
+                        except Exception as e:
+                            logger.debug(f"Failed to forward announcement to {peer.node_id[:16]}...: {e}")
+            else:
+                # Existing peer - update their info
+                peer = self.peers[sender_id]
+                peer.last_seen = time.time()
+                peer.compute_power = compute_power
+                peer.is_active = True
+                logger.debug(f"Updated existing peer {sender_id[:16]}... from announcement")
+            
+        except Exception as e:
+            logger.error(f"Error handling announcement from {addr}: {e}")
+        
+        return None
+    
+    async def _handle_gradient_share(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle gradient sharing for distributed training"""
+        try:
+            sender_id = message.sender_id
+            work_id = message.payload.get("work_id")
+            gradients = message.payload.get("gradients")
+            batch_size = message.payload.get("batch_size", 1)
+            epoch = message.payload.get("epoch", 0)
+            total_contributors = message.payload.get("total_contributors", 1)
+            
+            if not work_id or gradients is None:
+                logger.warning(f"Invalid gradient share from {sender_id[:16]}...: missing work_id or gradients")
+                return None
+            
+            logger.info(
+                f"📊 Received gradients from {sender_id[:16]}... "
+                f"for work {work_id[:8]}... (epoch {epoch}, batch_size {batch_size})"
+            )
+            
+            # Initialize buffer for this work_id if needed
+            if work_id not in self.gradient_buffer:
+                self.gradient_buffer[work_id] = []
+                self.gradient_counts[work_id] = total_contributors
+            
+            # Store the gradients with metadata
+            self.gradient_buffer[work_id].append({
+                "sender_id": sender_id,
+                "gradients": gradients,
+                "batch_size": batch_size,
+                "epoch": epoch,
+                "received_at": time.time()
+            })
+            
+            # Update peer reputation for contribution
+            if sender_id in self.peers:
+                self.peers[sender_id].reputation = min(2.0, self.peers[sender_id].reputation + 0.005)
+            
+            # Trigger callback if registered
+            if self.on_gradient_received:
+                self.on_gradient_received(work_id, gradients, sender_id)
+            
+            # Check if we have enough gradients to aggregate
+            if len(self.gradient_buffer[work_id]) >= self.gradient_counts[work_id]:
+                aggregated = await self._aggregate_gradients(work_id)
+                if aggregated and self.on_gradients_aggregated:
+                    self.on_gradients_aggregated(work_id, aggregated)
+            
+            # Acknowledge receipt
+            return Message(
+                msg_type=MessageType.GRADIENT_SHARE,
+                sender_id=self.node_id,
+                payload={
+                    "ack": True,
+                    "work_id": work_id,
+                    "received_count": len(self.gradient_buffer[work_id]),
+                    "expected_count": self.gradient_counts[work_id]
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling gradient share from {addr}: {e}")
+            return None
+    
+    async def _aggregate_gradients(self, work_id: str) -> Optional[dict]:
+        """Aggregate gradients from multiple peers using weighted averaging"""
+        try:
+            if work_id not in self.gradient_buffer:
+                return None
+            
+            gradient_list = self.gradient_buffer[work_id]
+            if not gradient_list:
+                return None
+            
+            logger.info(f"🔄 Aggregating {len(gradient_list)} gradient sets for work {work_id[:8]}...")
+            
+            # Compute weighted average based on batch sizes
+            total_samples = sum(g["batch_size"] for g in gradient_list)
+            
+            # Initialize aggregated gradients structure from first gradient
+            first_gradients = gradient_list[0]["gradients"]
+            aggregated = {}
+            
+            if isinstance(first_gradients, dict):
+                # Gradient is a dict of layer_name -> values
+                for key in first_gradients:
+                    weighted_sum = None
+                    for g_data in gradient_list:
+                        weight = g_data["batch_size"] / total_samples
+                        grad_value = g_data["gradients"].get(key)
+                        
+                        if grad_value is not None:
+                            if isinstance(grad_value, list):
+                                # Handle list of gradient values
+                                weighted_grad = [v * weight for v in grad_value]
+                                if weighted_sum is None:
+                                    weighted_sum = weighted_grad
+                                else:
+                                    weighted_sum = [a + b for a, b in zip(weighted_sum, weighted_grad)]
+                            elif isinstance(grad_value, (int, float)):
+                                # Handle scalar gradient values
+                                if weighted_sum is None:
+                                    weighted_sum = 0
+                                weighted_sum += grad_value * weight
+                    
+                    aggregated[key] = weighted_sum
+            elif isinstance(first_gradients, list):
+                # Gradient is a flat list
+                weighted_sum = [0.0] * len(first_gradients)
+                for g_data in gradient_list:
+                    weight = g_data["batch_size"] / total_samples
+                    for i, v in enumerate(g_data["gradients"]):
+                        weighted_sum[i] += v * weight
+                aggregated = weighted_sum
+            
+            # Store aggregated result
+            self.aggregated_gradients[work_id] = {
+                "gradients": aggregated,
+                "total_samples": total_samples,
+                "contributor_count": len(gradient_list),
+                "aggregated_at": time.time()
+            }
+            
+            # Clean up buffer
+            del self.gradient_buffer[work_id]
+            del self.gradient_counts[work_id]
+            
+            logger.info(f"✅ Gradient aggregation complete for work {work_id[:8]}... ({total_samples} total samples)")
+            
+            return self.aggregated_gradients[work_id]
+            
+        except Exception as e:
+            logger.error(f"Error aggregating gradients for {work_id}: {e}")
+            return None
+    
+    async def _handle_model_sync(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle model synchronization between peers"""
+        try:
+            sender_id = message.sender_id
+            model_version = message.payload.get("model_version")
+            model_state = message.payload.get("model_state")
+            sync_type = message.payload.get("sync_type", "full")  # "full" or "delta"
+            request_only = message.payload.get("request_only", False)
+            
+            if request_only:
+                # Peer is requesting our model state
+                logger.info(f"📤 Model sync request from {sender_id[:16]}...")
+                
+                if self.model_state:
+                    return Message(
+                        msg_type=MessageType.MODEL_SYNC,
+                        sender_id=self.node_id,
+                        payload={
+                            "model_version": self.current_model_version,
+                            "model_state": self.model_state,
+                            "sync_type": "full"
+                        }
+                    )
+                else:
+                    return Message(
+                        msg_type=MessageType.MODEL_SYNC,
+                        sender_id=self.node_id,
+                        payload={
+                            "error": "no_model_available",
+                            "model_version": self.current_model_version
+                        }
+                    )
+            
+            # Peer is sending us their model state
+            if model_version and model_state:
+                logger.info(
+                    f"📥 Model sync from {sender_id[:16]}... "
+                    f"(version {model_version}, type: {sync_type})"
+                )
+                
+                # Store pending sync for review/application
+                self.pending_model_syncs[sender_id] = {
+                    "model_version": model_version,
+                    "model_state": model_state,
+                    "sync_type": sync_type,
+                    "received_at": time.time()
+                }
+                
+                # Compare versions and decide whether to apply
+                if self._version_is_newer(model_version, self.current_model_version):
+                    logger.info(f"Received newer model version {model_version} (current: {self.current_model_version})")
+                    
+                    # Apply the model update
+                    if sync_type == "delta" and self.model_state:
+                        # Apply delta update
+                        self.model_state = self._apply_model_delta(self.model_state, model_state)
+                    else:
+                        # Full replacement
+                        self.model_state = model_state
+                    
+                    self.current_model_version = model_version
+                    
+                    # Trigger callback
+                    if self.on_model_sync:
+                        self.on_model_sync(model_version, model_state)
+                    
+                    # Update peer reputation for sharing updates
+                    if sender_id in self.peers:
+                        self.peers[sender_id].reputation = min(2.0, self.peers[sender_id].reputation + 0.01)
+                
+                # Acknowledge sync
+                return Message(
+                    msg_type=MessageType.MODEL_SYNC,
+                    sender_id=self.node_id,
+                    payload={
+                        "ack": True,
+                        "current_version": self.current_model_version,
+                        "applied": self._version_is_newer(model_version, self.current_model_version)
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"Error handling model sync from {addr}: {e}")
+        
+        return None
+    
+    def _version_is_newer(self, new_version: str, current_version: str) -> bool:
+        """Compare semantic versions to check if new_version is newer"""
+        try:
+            new_parts = [int(x) for x in new_version.split(".")]
+            current_parts = [int(x) for x in current_version.split(".")]
+            
+            # Pad shorter version with zeros
+            while len(new_parts) < len(current_parts):
+                new_parts.append(0)
+            while len(current_parts) < len(new_parts):
+                current_parts.append(0)
+            
+            return new_parts > current_parts
+        except Exception as e:
+            logger.debug(f"Version comparison failed for '{new_version}' vs '{current_version}': {e}")
+            return False
+    
+    def _apply_model_delta(self, base_state: dict, delta: dict) -> dict:
+        """Apply delta updates to model state"""
+        result = base_state.copy()
+        for key, value in delta.items():
+            if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+                result[key] = self._apply_model_delta(result[key], value)
+            else:
+                result[key] = value
+        return result
+    
+    async def _handle_token_transfer(self, message: Message, addr: tuple) -> Optional[Message]:
+        """Handle token transfer requests and confirmations"""
+        try:
+            sender_id = message.sender_id
+            transfer_type = message.payload.get("type")  # "request", "confirm", "reject"
+            transfer_id = message.payload.get("transfer_id")
+            amount = message.payload.get("amount", 0)
+            reason = message.payload.get("reason", "unspecified")
+            
+            if transfer_type == "request":
+                # Someone is requesting tokens from us
+                recipient = message.payload.get("recipient", sender_id)
+                
+                logger.info(
+                    f"💰 Token transfer request from {sender_id[:16]}...: "
+                    f"{amount} AOAI for '{reason}'"
+                )
+                
+                # Validate the request
+                if amount <= 0:
+                    return Message(
+                        msg_type=MessageType.TOKEN_TRANSFER,
+                        sender_id=self.node_id,
+                        payload={
+                            "type": "reject",
+                            "transfer_id": transfer_id,
+                            "reason": "invalid_amount"
+                        }
+                    )
+                
+                if amount > self.token_balance:
+                    return Message(
+                        msg_type=MessageType.TOKEN_TRANSFER,
+                        sender_id=self.node_id,
+                        payload={
+                            "type": "reject",
+                            "transfer_id": transfer_id,
+                            "reason": "insufficient_balance"
+                        }
+                    )
+                
+                # Generate transfer ID if not provided
+                if not transfer_id:
+                    transfer_id = hashlib.sha256(
+                        f"{self.node_id}{recipient}{amount}{time.time()}".encode()
+                    ).hexdigest()[:16]
+                
+                # Store pending transfer
+                self.pending_transfers[transfer_id] = {
+                    "from": self.node_id,
+                    "to": recipient,
+                    "amount": amount,
+                    "reason": reason,
+                    "status": "pending",
+                    "created_at": time.time()
+                }
+                
+                # Execute the transfer (deduct from our balance)
+                self.token_balance -= amount
+                self.pending_transfers[transfer_id]["status"] = "completed"
+                
+                # Log to transfer history
+                self.transfer_history.append({
+                    "transfer_id": transfer_id,
+                    "type": "outgoing",
+                    "to": recipient,
+                    "amount": amount,
+                    "reason": reason,
+                    "timestamp": time.time()
+                })
+                
+                logger.info(f"✅ Token transfer {transfer_id[:8]}... completed: {amount} AOAI to {recipient[:16]}...")
+                
+                if self.on_tokens_earned:
+                    self.on_tokens_earned(-amount, reason)  # Negative for outgoing
+                
+                return Message(
+                    msg_type=MessageType.TOKEN_TRANSFER,
+                    sender_id=self.node_id,
+                    payload={
+                        "type": "confirm",
+                        "transfer_id": transfer_id,
+                        "amount": amount,
+                        "new_balance": self.token_balance
+                    }
+                )
+                
+            elif transfer_type == "confirm":
+                # Transfer to us was confirmed
+                logger.info(f"✅ Incoming transfer {transfer_id[:8]}... confirmed: {amount} AOAI")
+                
+                self.token_balance += amount
+                
+                self.transfer_history.append({
+                    "transfer_id": transfer_id,
+                    "type": "incoming",
+                    "from": sender_id,
+                    "amount": amount,
+                    "timestamp": time.time()
+                })
+                
+                if self.on_tokens_earned:
+                    self.on_tokens_earned(amount, "transfer_received")
+                
+            elif transfer_type == "reject":
+                # Our transfer request was rejected
+                reject_reason = message.payload.get("reason", "unknown")
+                logger.warning(f"❌ Transfer {transfer_id[:8]}... rejected: {reject_reason}")
+                
+                if transfer_id in self.pending_transfers:
+                    self.pending_transfers[transfer_id]["status"] = "rejected"
+                    self.pending_transfers[transfer_id]["reject_reason"] = reject_reason
+            
+        except Exception as e:
+            logger.error(f"Error handling token transfer from {addr}: {e}")
+        
+        return None
     
     # Public API
     async def submit_work(self, work: dict) -> str:
@@ -578,8 +1112,129 @@ class P2PNode:
             "active_peers": sum(1 for p in self.peers.values() if p.is_active),
             "total_compute_tflops": sum(p.compute_power for p in self.peers.values()),
             "token_balance": self.token_balance,
-            "work_completed": len(self.completed_work)
+            "work_completed": len(self.completed_work),
+            "pending_work": len(self.pending_work),
+            "pending_gradients": len(self.gradient_buffer),
+            "aggregated_gradients": len(self.aggregated_gradients),
+            "model_version": self.current_model_version,
+            "pending_transfers": len(self.pending_transfers),
+            "transfer_history_count": len(self.transfer_history),
+            "average_peer_reputation": (
+                sum(p.reputation for p in self.peers.values()) / len(self.peers)
+                if self.peers else 0
+            )
         }
+    
+    # Public APIs for gradient sharing and model sync
+    
+    async def share_gradients(self, work_id: str, gradients: dict, batch_size: int = 1, epoch: int = 0):
+        """Share computed gradients with peers for aggregation"""
+        message = Message(
+            msg_type=MessageType.GRADIENT_SHARE,
+            sender_id=self.node_id,
+            payload={
+                "work_id": work_id,
+                "gradients": gradients,
+                "batch_size": batch_size,
+                "epoch": epoch,
+                "total_contributors": len(self.peers) + 1  # Include ourselves
+            }
+        )
+        
+        logger.info(f"📤 Sharing gradients for work {work_id[:8]}... with {len(self.peers)} peers")
+        await self._broadcast(message)
+    
+    async def request_model_sync(self, peer_id: Optional[str] = None):
+        """Request model state from a peer or broadcast request"""
+        message = Message(
+            msg_type=MessageType.MODEL_SYNC,
+            sender_id=self.node_id,
+            payload={
+                "request_only": True,
+                "current_version": self.current_model_version
+            }
+        )
+        
+        if peer_id and peer_id in self.peers:
+            await self._send_to_peer(self.peers[peer_id], message)
+            logger.info(f"📤 Requesting model sync from {peer_id[:16]}...")
+        else:
+            # Request from the peer with highest reputation
+            best_peer = max(self.peers.values(), key=lambda p: p.reputation, default=None)
+            if best_peer:
+                await self._send_to_peer(best_peer, message)
+                logger.info(f"📤 Requesting model sync from best peer {best_peer.node_id[:16]}...")
+    
+    async def broadcast_model_update(self, model_state: dict, version: str, sync_type: str = "full"):
+        """Broadcast model update to all peers"""
+        self.model_state = model_state
+        self.current_model_version = version
+        
+        message = Message(
+            msg_type=MessageType.MODEL_SYNC,
+            sender_id=self.node_id,
+            payload={
+                "model_version": version,
+                "model_state": model_state,
+                "sync_type": sync_type
+            }
+        )
+        
+        logger.info(f"📤 Broadcasting model update v{version} to {len(self.peers)} peers")
+        await self._broadcast(message)
+    
+    async def transfer_tokens(self, recipient_id: str, amount: float, reason: str = "reward") -> Optional[str]:
+        """Transfer tokens to another peer"""
+        if recipient_id not in self.peers:
+            logger.warning(f"Cannot transfer tokens: peer {recipient_id[:16]}... not found")
+            return None
+        
+        if amount > self.token_balance:
+            logger.warning(f"Cannot transfer tokens: insufficient balance ({self.token_balance} < {amount})")
+            return None
+        
+        transfer_id = hashlib.sha256(
+            f"{self.node_id}{recipient_id}{amount}{time.time()}".encode()
+        ).hexdigest()[:16]
+        
+        message = Message(
+            msg_type=MessageType.TOKEN_TRANSFER,
+            sender_id=self.node_id,
+            payload={
+                "type": "request",
+                "transfer_id": transfer_id,
+                "recipient": recipient_id,
+                "amount": amount,
+                "reason": reason
+            }
+        )
+        
+        # Store pending outgoing transfer
+        self.pending_transfers[transfer_id] = {
+            "from": self.node_id,
+            "to": recipient_id,
+            "amount": amount,
+            "reason": reason,
+            "status": "pending",
+            "created_at": time.time()
+        }
+        
+        await self._send_to_peer(self.peers[recipient_id], message)
+        logger.info(f"📤 Token transfer initiated: {amount} AOAI to {recipient_id[:16]}... ({transfer_id[:8]}...)")
+        
+        return transfer_id
+    
+    def get_aggregated_gradients(self, work_id: str) -> Optional[dict]:
+        """Get aggregated gradients for a work item if available"""
+        return self.aggregated_gradients.get(work_id)
+    
+    def get_pending_model_syncs(self) -> Dict[str, dict]:
+        """Get all pending model syncs from peers"""
+        return self.pending_model_syncs.copy()
+    
+    def get_transfer_history(self, limit: int = 100) -> List[dict]:
+        """Get recent token transfer history"""
+        return self.transfer_history[-limit:]
     
     async def stop(self):
         """Stop the P2P node"""

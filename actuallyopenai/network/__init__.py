@@ -18,12 +18,33 @@ try:
         ComputeCapability,
         TrainingJob,
         NodeRole,
+        # FedAvg and aggregation strategies
+        AggregationStrategy,
+        FederatedAggregator,
+        FedAvgAggregator,
+        FedProxAggregator,
+        KrumAggregator,
+        TrimmedMeanAggregator,
+        MedianAggregator,
+        WorkerUpdate,
+        torch_to_numpy_dict,
+        numpy_to_torch_dict,
     )
 except ImportError:
     NetworkComputeAggregator = None
     ComputeCapability = None
     TrainingJob = None
     NodeRole = None
+    AggregationStrategy = None
+    FederatedAggregator = None
+    FedAvgAggregator = None
+    FedProxAggregator = None
+    KrumAggregator = None
+    TrimmedMeanAggregator = None
+    MedianAggregator = None
+    WorkerUpdate = None
+    torch_to_numpy_dict = None
+    numpy_to_torch_dict = None
 
 __all__ = [
     "P2PNode",
@@ -39,4 +60,15 @@ __all__ = [
     "ComputeCapability",
     "TrainingJob",
     "NodeRole",
+    # FedAvg and aggregation
+    "AggregationStrategy",
+    "FederatedAggregator",
+    "FedAvgAggregator",
+    "FedProxAggregator",
+    "KrumAggregator",
+    "TrimmedMeanAggregator",
+    "MedianAggregator",
+    "WorkerUpdate",
+    "torch_to_numpy_dict",
+    "numpy_to_torch_dict",
 ]

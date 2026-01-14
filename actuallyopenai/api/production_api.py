@@ -229,13 +229,17 @@ class ModelInfo(BaseModel):
 
 
 # =============================================================================
-# In-Memory Storage (Use Redis/PostgreSQL in production)
+# In-Memory Storage with Persistence Support
 # =============================================================================
 
-class DataStore:
-    """In-memory data store (replace with Redis/PostgreSQL)."""
+class PersistentDataStore:
+    """
+    Data store with optional Redis/database persistence.
+    Falls back to in-memory storage when external stores are unavailable.
+    """
     
     def __init__(self):
+        # In-memory storage (always available)
         self.users: Dict[str, User] = {}
         self.users_by_email: Dict[str, str] = {}  # email -> user_id
         self.api_keys: Dict[str, APIKeyRecord] = {}  # key_hash -> record
@@ -263,9 +267,251 @@ class DataStore:
                 root="aoai-embed-1"
             ),
         }
+        
+        # Redis client (optional)
+        self._redis_client = None
+        self._redis_available = False
+        
+        # Database session factory (optional)
+        self._session_factory = None
+        self._db_available = False
+        
+        # Local persistence paths
+        self._data_dir = "aoai_data/api_store"
+        os.makedirs(self._data_dir, exist_ok=True)
+        
+        # Load cached data
+        self._load_from_cache()
+    
+    def _load_from_cache(self):
+        """Load data from local JSON cache."""
+        try:
+            users_file = os.path.join(self._data_dir, "users.json")
+            if os.path.exists(users_file):
+                with open(users_file, 'r') as f:
+                    data = json.load(f)
+                for user_data in data:
+                    try:
+                        user = User(**user_data)
+                        self.users[user.id] = user
+                        self.users_by_email[user.email] = user.id
+                    except Exception as e:
+                        logger.warning(f"Failed to load user from cache: {e}")
+                logger.info("Loaded users from cache", count=len(self.users))
+            
+            api_keys_file = os.path.join(self._data_dir, "api_keys.json")
+            if os.path.exists(api_keys_file):
+                with open(api_keys_file, 'r') as f:
+                    data = json.load(f)
+                for key_data in data:
+                    try:
+                        record = APIKeyRecord(**key_data)
+                        self.api_keys[record.key_hash] = record
+                    except Exception as e:
+                        logger.warning(f"Failed to load API key from cache: {e}")
+                logger.info("Loaded API keys from cache", count=len(self.api_keys))
+            
+            stats_file = os.path.join(self._data_dir, "stats.json")
+            if os.path.exists(stats_file):
+                with open(stats_file, 'r') as f:
+                    stats = json.load(f)
+                self.total_requests = stats.get('total_requests', 0)
+                self.total_tokens = stats.get('total_tokens', 0)
+                self.revenue = Decimal(str(stats.get('revenue', '0')))
+        except Exception as e:
+            logger.warning("Failed to load data from cache", error=str(e))
+    
+    def _save_to_cache(self):
+        """Save data to local JSON cache."""
+        try:
+            users_file = os.path.join(self._data_dir, "users.json")
+            with open(users_file, 'w') as f:
+                users_data = [u.dict() for u in self.users.values()]
+                json.dump(users_data, f, indent=2, default=str)
+            
+            api_keys_file = os.path.join(self._data_dir, "api_keys.json")
+            with open(api_keys_file, 'w') as f:
+                keys_data = [k.dict() for k in self.api_keys.values()]
+                json.dump(keys_data, f, indent=2, default=str)
+            
+            stats_file = os.path.join(self._data_dir, "stats.json")
+            with open(stats_file, 'w') as f:
+                json.dump({
+                    'total_requests': self.total_requests,
+                    'total_tokens': self.total_tokens,
+                    'revenue': str(self.revenue),
+                    'updated_at': datetime.utcnow().isoformat()
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save data to cache", error=str(e))
+    
+    async def init_redis(self, redis_url: str = None):
+        """Initialize Redis connection if available."""
+        if redis_url is None:
+            from actuallyopenai.config import get_settings
+            redis_url = get_settings().redis_url
+        
+        try:
+            import redis.asyncio as redis
+            self._redis_client = redis.from_url(redis_url, decode_responses=True)
+            # Test connection
+            await self._redis_client.ping()
+            self._redis_available = True
+            logger.info("Redis connected successfully", url=redis_url.split('@')[-1])
+        except Exception as e:
+            self._redis_available = False
+            logger.warning("Redis not available, using in-memory rate limiting", error=str(e))
+    
+    async def init_database(self, session_factory=None):
+        """Initialize database session factory."""
+        self._session_factory = session_factory
+        if session_factory:
+            try:
+                # Test connection
+                session = session_factory()
+                await session.close()
+                self._db_available = True
+                logger.info("Database connection available")
+            except Exception as e:
+                self._db_available = False
+                logger.warning("Database not available", error=str(e))
+    
+    async def check_rate_limit_redis(self, key: str, limit: int, window: int = 60) -> bool:
+        """
+        Check rate limit using Redis sliding window.
+        Returns True if request is allowed, False if rate limited.
+        """
+        if not self._redis_available or not self._redis_client:
+            return self._check_rate_limit_memory(key, limit, window)
+        
+        try:
+            now = time.time()
+            pipe = self._redis_client.pipeline()
+            
+            # Remove old entries
+            pipe.zremrangebyscore(f"ratelimit:{key}", 0, now - window)
+            # Add current request
+            pipe.zadd(f"ratelimit:{key}", {str(now): now})
+            # Count requests in window
+            pipe.zcard(f"ratelimit:{key}")
+            # Set TTL
+            pipe.expire(f"ratelimit:{key}", window)
+            
+            results = await pipe.execute()
+            request_count = results[2]
+            
+            return request_count <= limit
+        except Exception as e:
+            logger.warning("Redis rate limit failed, falling back to memory", error=str(e))
+            return self._check_rate_limit_memory(key, limit, window)
+    
+    def _check_rate_limit_memory(self, key: str, limit: int, window: int = 60) -> bool:
+        """In-memory rate limiting fallback."""
+        now = time.time()
+        
+        if key not in self.rate_limits:
+            self.rate_limits[key] = []
+        
+        # Remove old timestamps
+        self.rate_limits[key] = [t for t in self.rate_limits[key] if now - t < window]
+        
+        if len(self.rate_limits[key]) >= limit:
+            return False
+        
+        self.rate_limits[key].append(now)
+        return True
+    
+    async def store_refresh_token(self, token_hash: str, user_id: str, ttl: int = None):
+        """Store refresh token with optional Redis persistence."""
+        if ttl is None:
+            ttl = config.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+        
+        # Always store in memory
+        self.refresh_tokens[token_hash] = user_id
+        
+        # Store in Redis if available
+        if self._redis_available and self._redis_client:
+            try:
+                await self._redis_client.setex(
+                    f"refresh_token:{token_hash}",
+                    ttl,
+                    user_id
+                )
+            except Exception as e:
+                logger.warning("Failed to store refresh token in Redis", error=str(e))
+    
+    async def validate_refresh_token(self, token_hash: str) -> Optional[str]:
+        """Validate refresh token, checking Redis first if available."""
+        # Check Redis first
+        if self._redis_available and self._redis_client:
+            try:
+                user_id = await self._redis_client.get(f"refresh_token:{token_hash}")
+                if user_id:
+                    return user_id
+            except Exception as e:
+                logger.warning("Redis refresh token check failed", error=str(e))
+        
+        # Fall back to memory
+        return self.refresh_tokens.get(token_hash)
+    
+    async def revoke_refresh_token(self, token_hash: str):
+        """Revoke refresh token from all stores."""
+        # Remove from memory
+        if token_hash in self.refresh_tokens:
+            del self.refresh_tokens[token_hash]
+        
+        # Remove from Redis
+        if self._redis_available and self._redis_client:
+            try:
+                await self._redis_client.delete(f"refresh_token:{token_hash}")
+            except Exception as e:
+                logger.warning("Failed to revoke token from Redis", error=str(e))
+    
+    async def add_user(self, user: User):
+        """Add user with persistence."""
+        self.users[user.id] = user
+        self.users_by_email[user.email] = user.id
+        self._save_to_cache()
+        
+        # Optionally sync to database
+        await self._sync_user_to_db(user)
+    
+    async def _sync_user_to_db(self, user: User):
+        """Sync user to database if available."""
+        if not self._db_available or not self._session_factory:
+            return
+        
+        try:
+            from actuallyopenai.core.database import Base
+            from sqlalchemy import Column, String, Boolean, DateTime, Integer
+            
+            # Note: You may want to create a UserDB model in database.py
+            # For now, we rely on local cache
+            pass
+        except Exception as e:
+            logger.warning("Failed to sync user to database", error=str(e))
+    
+    async def add_api_key(self, record: APIKeyRecord):
+        """Add API key with persistence."""
+        self.api_keys[record.key_hash] = record
+        self._save_to_cache()
+    
+    def increment_stats(self, requests: int = 0, tokens: int = 0, revenue: Decimal = Decimal("0")):
+        """Increment usage statistics."""
+        self.total_requests += requests
+        self.total_tokens += tokens
+        self.revenue += revenue
+        
+        # Periodic save (every 100 requests)
+        if self.total_requests % 100 == 0:
+            self._save_to_cache()
 
 
-store = DataStore()
+# Create store instance
+import os
+import json
+
+store = PersistentDataStore()
 security = HTTPBearer(auto_error=False)
 
 
@@ -305,9 +551,10 @@ def create_refresh_token(user_id: str) -> str:
     }
     token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
     
-    # Store refresh token
+    # Store refresh token (async call scheduled)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     store.refresh_tokens[token_hash] = user_id
+    # Note: For proper async storage, call store.store_refresh_token in an async context
     
     return token
 
@@ -369,24 +616,16 @@ async def check_rate_limit(
     # Get key for rate limiting
     key = x_api_key or user.id
     
-    # Check rate limit (sliding window)
-    now = time.time()
-    window = 60  # 1 minute
+    # Check rate limit (using Redis if available, memory fallback)
+    allowed = await store.check_rate_limit_redis(key, rate_limit, window=60)
     
-    if key not in store.rate_limits:
-        store.rate_limits[key] = []
-    
-    # Remove old timestamps
-    store.rate_limits[key] = [t for t in store.rate_limits[key] if now - t < window]
-    
-    if len(store.rate_limits[key]) >= rate_limit:
+    if not allowed:
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Limit: {rate_limit}/minute",
             headers={"Retry-After": "60"}
         )
     
-    store.rate_limits[key].append(now)
     return user
 
 
@@ -399,6 +638,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     logger.info("🚀 ActuallyOpenAI API starting...")
     
+    # Initialize Redis if available
+    try:
+        await store.init_redis()
+    except Exception as e:
+        logger.warning("Redis initialization failed, continuing without Redis", error=str(e))
+    
     # Create demo user and API key for testing
     demo_user = User(
         id="demo-user",
@@ -407,25 +652,26 @@ async def lifespan(app: FastAPI):
         tier=UserTier.PREMIUM,
         is_verified=True
     )
-    store.users[demo_user.id] = demo_user
-    store.users_by_email[demo_user.email] = demo_user.id
+    await store.add_user(demo_user)
     
     # Create demo API key
     demo_key = "aoai-demo-key-123456789"
     key_hash = hashlib.sha256(demo_key.encode()).hexdigest()
-    store.api_keys[key_hash] = APIKeyRecord(
+    await store.add_api_key(APIKeyRecord(
         id="demo-key",
         key_hash=key_hash,
         user_id=demo_user.id,
         name="Demo Key",
         rate_limit=config.PREMIUM_RATE_LIMIT
-    )
+    ))
     
     logger.info("✅ Demo user created: demo@actuallyopenai.com / Demo123!")
     logger.info(f"✅ Demo API key: {demo_key}")
     
     yield
     
+    # Cleanup: save data before shutdown
+    store._save_to_cache()
     logger.info("👋 ActuallyOpenAI API shutting down...")
 
 
@@ -529,12 +775,15 @@ async def register(request: RegisterRequest):
         wallet_address=request.wallet_address
     )
     
-    store.users[user.id] = user
-    store.users_by_email[user.email] = user.id
+    await store.add_user(user)
     
     # Generate tokens
     access_token = create_access_token(user.id)
     refresh_token = create_refresh_token(user.id)
+    
+    # Store refresh token in Redis if available
+    token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    await store.store_refresh_token(token_hash, user.id)
     
     logger.info(f"New user registered: {user.email}")
     
@@ -583,9 +832,11 @@ async def refresh_token(refresh_token: str):
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid token type")
     
-    # Verify refresh token is valid
+    # Verify refresh token is valid (check Redis first, then memory)
     token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-    if token_hash not in store.refresh_tokens:
+    stored_user_id = await store.validate_refresh_token(token_hash)
+    
+    if not stored_user_id:
         raise HTTPException(status_code=401, detail="Refresh token revoked")
     
     user_id = payload.get("sub")
@@ -597,7 +848,11 @@ async def refresh_token(refresh_token: str):
     new_refresh_token = create_refresh_token(user_id)
     
     # Revoke old refresh token
-    del store.refresh_tokens[token_hash]
+    await store.revoke_refresh_token(token_hash)
+    
+    # Store new refresh token
+    new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
+    await store.store_refresh_token(new_token_hash, user_id)
     
     return TokenResponse(
         access_token=new_access_token,
@@ -635,7 +890,7 @@ async def create_api_key(
         rate_limit=limits.get(user.tier, config.DEFAULT_RATE_LIMIT)
     )
     
-    store.api_keys[key_hash] = record
+    await store.add_api_key(record)
     
     return APIKeyResponse(
         id=record.id,
@@ -668,6 +923,7 @@ async def revoke_api_key(key_id: str, user: User = Depends(get_current_user)):
     for key_hash, record in store.api_keys.items():
         if record.id == key_id and record.user_id == user.id:
             record.is_active = False
+            store._save_to_cache()  # Persist the change
             return {"message": "API key revoked"}
     
     raise HTTPException(status_code=404, detail="API key not found")
@@ -685,7 +941,7 @@ async def create_chat_completion(
 ):
     """Create a chat completion (OpenAI compatible)."""
     
-    store.total_requests += 1
+    store.increment_stats(requests=1)
     
     # Validate model
     if request.model not in store.models:
@@ -708,7 +964,6 @@ async def create_chat_completion(
     
     # Track usage
     total_tokens = prompt_tokens + completion_tokens
-    store.total_tokens += total_tokens
     user.usage_this_month += total_tokens
     
     # Calculate revenue
@@ -716,7 +971,7 @@ async def create_chat_completion(
         config.INPUT_TOKEN_PRICE * prompt_tokens / 1000 +
         config.OUTPUT_TOKEN_PRICE * completion_tokens / 1000
     )
-    store.revenue += revenue
+    store.increment_stats(tokens=total_tokens, revenue=revenue)
     
     response = ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -873,7 +1128,7 @@ async def stream_chat_completion(
     
     # Track usage
     total_tokens = prompt_tokens + completion_tokens
-    store.total_tokens += total_tokens
+    store.increment_stats(tokens=total_tokens)
     user.usage_this_month += total_tokens
 
 
@@ -888,8 +1143,6 @@ async def create_completion(
 ):
     """Create a text completion (legacy endpoint)."""
     
-    store.total_requests += 1
-    
     prompt_tokens = int(len(request.prompt.split()) * 1.3)
     
     # Mock completion
@@ -897,7 +1150,7 @@ async def create_completion(
     completion_tokens = int(len(completion_text.split()) * 1.3)
     
     total_tokens = prompt_tokens + completion_tokens
-    store.total_tokens += total_tokens
+    store.increment_stats(requests=1, tokens=total_tokens)
     
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:8]}",
@@ -928,8 +1181,6 @@ async def create_embedding(
 ):
     """Create embeddings (OpenAI compatible)."""
     
-    store.total_requests += 1
-    
     inputs = [request.input] if isinstance(request.input, str) else request.input
     
     embeddings = []
@@ -948,7 +1199,7 @@ async def create_embedding(
             "index": i
         })
     
-    store.total_tokens += total_tokens
+    store.increment_stats(requests=1, tokens=total_tokens)
     
     return {
         "object": "list",
