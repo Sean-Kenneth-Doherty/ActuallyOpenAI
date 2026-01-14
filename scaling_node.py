@@ -315,7 +315,10 @@ class ScalingNode:
             for _ in range(min(max_tokens, 256)):
                 outputs = self.scalable_model(input_ids)
                 
-                if isinstance(outputs, tuple):
+                # Handle dict output from ScalableAOAI
+                if isinstance(outputs, dict):
+                    logits = outputs["logits"]
+                elif isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
