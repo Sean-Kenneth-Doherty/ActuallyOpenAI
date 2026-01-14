@@ -13,21 +13,23 @@ Features:
 
 import asyncio
 import hashlib
+import json
 import jwt
+import os
 import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Dict, Any, List, AsyncGenerator
+from typing import Optional, Dict, Any, List, AsyncGenerator, Callable
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, EmailStr, validator
+from pydantic import BaseModel, Field, EmailStr, field_validator
 import structlog
 
 logger = structlog.get_logger()
@@ -58,6 +60,16 @@ class ProductionConfig:
     # Model defaults
     MAX_CONTEXT_LENGTH: int = 8192
     MAX_OUTPUT_TOKENS: int = 4096
+    
+    # Redis Settings (from environment variables)
+    REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_MAX_CONNECTIONS: int = int(os.environ.get("REDIS_MAX_CONNECTIONS", "10"))
+    REDIS_SOCKET_TIMEOUT: float = float(os.environ.get("REDIS_SOCKET_TIMEOUT", "5.0"))
+    REDIS_RETRY_ON_TIMEOUT: bool = os.environ.get("REDIS_RETRY_ON_TIMEOUT", "true").lower() == "true"
+    
+    # Cache Settings
+    CACHE_TTL_SECONDS: int = int(os.environ.get("CACHE_TTL_SECONDS", "300"))  # 5 minutes default
+    SESSION_TTL_SECONDS: int = int(os.environ.get("SESSION_TTL_SECONDS", "3600"))  # 1 hour default
 
 
 config = ProductionConfig()
@@ -109,8 +121,9 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8)
     wallet_address: Optional[str] = None
     
-    @validator('password')
-    def password_strength(cls, v):
+    @field_validator('password')
+    @classmethod
+    def password_strength(cls, v: str) -> str:
         if not any(c.isupper() for c in v):
             raise ValueError('Password must contain uppercase letter')
         if not any(c.isdigit() for c in v):
@@ -236,10 +249,19 @@ class PersistentDataStore:
     """
     Data store with optional Redis/database persistence.
     Falls back to in-memory storage when external stores are unavailable.
+    
+    Features:
+    - Redis connection pooling for efficient resource usage
+    - Redis-backed rate limiting with sliding window
+    - Redis-backed user session storage
+    - Redis pub/sub for real-time updates
+    - Request caching for improved performance
+    - Graceful fallback to in-memory when Redis unavailable
+    - Health checks for Redis connection monitoring
     """
     
     def __init__(self):
-        # In-memory storage (always available)
+        # In-memory storage (always available as fallback)
         self.users: Dict[str, User] = {}
         self.users_by_email: Dict[str, str] = {}  # email -> user_id
         self.api_keys: Dict[str, APIKeyRecord] = {}  # key_hash -> record
@@ -248,6 +270,12 @@ class PersistentDataStore:
         self.revenue: Decimal = Decimal("0")
         self.total_requests: int = 0
         self.total_tokens: int = 0
+        
+        # In-memory cache fallback
+        self._memory_cache: Dict[str, Dict[str, Any]] = {}  # key -> {value, expires_at}
+        
+        # In-memory sessions fallback
+        self._memory_sessions: Dict[str, Dict[str, Any]] = {}  # session_id -> session_data
         
         # Available models
         self.models = {
@@ -268,13 +296,25 @@ class PersistentDataStore:
             ),
         }
         
-        # Redis client (optional)
+        # Redis client and connection pool (optional)
         self._redis_client = None
+        self._redis_pool = None
         self._redis_available = False
+        self._redis_url: Optional[str] = None
+        
+        # Redis pub/sub client and subscriptions
+        self._pubsub_client = None
+        self._pubsub_task: Optional[asyncio.Task] = None
+        self._pubsub_handlers: Dict[str, List[Callable]] = {}
         
         # Database session factory (optional)
         self._session_factory = None
         self._db_available = False
+        
+        # Health check state
+        self._redis_last_health_check: Optional[datetime] = None
+        self._redis_health_status: str = "unknown"
+        self._redis_latency_ms: float = 0.0
         
         # Local persistence paths
         self._data_dir = "aoai_data/api_store"
@@ -326,12 +366,12 @@ class PersistentDataStore:
         try:
             users_file = os.path.join(self._data_dir, "users.json")
             with open(users_file, 'w') as f:
-                users_data = [u.dict() for u in self.users.values()]
+                users_data = [u.model_dump() for u in self.users.values()]
                 json.dump(users_data, f, indent=2, default=str)
             
             api_keys_file = os.path.join(self._data_dir, "api_keys.json")
             with open(api_keys_file, 'w') as f:
-                keys_data = [k.dict() for k in self.api_keys.values()]
+                keys_data = [k.model_dump() for k in self.api_keys.values()]
                 json.dump(keys_data, f, indent=2, default=str)
             
             stats_file = os.path.join(self._data_dir, "stats.json")
@@ -346,21 +386,123 @@ class PersistentDataStore:
             logger.warning("Failed to save data to cache", error=str(e))
     
     async def init_redis(self, redis_url: str = None):
-        """Initialize Redis connection if available."""
+        """
+        Initialize Redis connection with connection pooling.
+        
+        Args:
+            redis_url: Redis connection URL. Falls back to config/env if not provided.
+        
+        Features:
+            - Connection pooling for efficient resource usage
+            - Configurable timeouts and retry behavior
+            - Health check on initialization
+        """
         if redis_url is None:
-            from actuallyopenai.config import get_settings
-            redis_url = get_settings().redis_url
+            redis_url = config.REDIS_URL
+            try:
+                from actuallyopenai.config import get_settings
+                redis_url = get_settings().redis_url
+            except Exception:
+                pass  # Use config default
+        
+        self._redis_url = redis_url
         
         try:
-            import redis.asyncio as redis
-            self._redis_client = redis.from_url(redis_url, decode_responses=True)
-            # Test connection
+            import redis.asyncio as redis_async
+            from redis.asyncio.connection import ConnectionPool
+            
+            # Create connection pool with configurable settings
+            self._redis_pool = ConnectionPool.from_url(
+                redis_url,
+                max_connections=config.REDIS_MAX_CONNECTIONS,
+                socket_timeout=config.REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=config.REDIS_SOCKET_TIMEOUT,
+                retry_on_timeout=config.REDIS_RETRY_ON_TIMEOUT,
+                decode_responses=True
+            )
+            
+            # Create Redis client with connection pool
+            self._redis_client = redis_async.Redis(connection_pool=self._redis_pool)
+            
+            # Test connection and measure latency
+            start_time = time.time()
             await self._redis_client.ping()
+            self._redis_latency_ms = (time.time() - start_time) * 1000
+            
             self._redis_available = True
-            logger.info("Redis connected successfully", url=redis_url.split('@')[-1])
+            self._redis_health_status = "healthy"
+            self._redis_last_health_check = datetime.utcnow()
+            
+            # Sanitize URL for logging (remove password)
+            safe_url = redis_url.split('@')[-1] if '@' in redis_url else redis_url
+            logger.info(
+                "Redis connected successfully with connection pooling",
+                url=safe_url,
+                max_connections=config.REDIS_MAX_CONNECTIONS,
+                latency_ms=round(self._redis_latency_ms, 2)
+            )
+            
+            # Initialize pub/sub client
+            await self._init_pubsub()
+            
+        except ImportError:
+            self._redis_available = False
+            self._redis_health_status = "unavailable"
+            logger.warning("Redis package not installed. Install with: pip install redis")
         except Exception as e:
             self._redis_available = False
-            logger.warning("Redis not available, using in-memory rate limiting", error=str(e))
+            self._redis_health_status = "error"
+            logger.warning("Redis not available, using in-memory fallback", error=str(e))
+    
+    async def _init_pubsub(self):
+        """
+        Initialize Redis pub/sub client for real-time updates.
+        """
+        if not self._redis_available or not self._redis_client:
+            return
+        
+        try:
+            self._pubsub_client = self._redis_client.pubsub()
+            logger.info("Redis pub/sub initialized")
+        except Exception as e:
+            logger.warning("Failed to initialize Redis pub/sub", error=str(e))
+    
+    async def close_redis(self):
+        """
+        Gracefully close Redis connections.
+        """
+        # Cancel pub/sub listener task
+        if self._pubsub_task and not self._pubsub_task.done():
+            self._pubsub_task.cancel()
+            try:
+                await self._pubsub_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Close pub/sub client
+        if self._pubsub_client:
+            try:
+                await self._pubsub_client.close()
+            except Exception:
+                pass
+        
+        # Close main Redis client
+        if self._redis_client:
+            try:
+                await self._redis_client.close()
+            except Exception:
+                pass
+        
+        # Close connection pool
+        if self._redis_pool:
+            try:
+                await self._redis_pool.disconnect()
+            except Exception:
+                pass
+        
+        self._redis_available = False
+        self._redis_health_status = "closed"
+        logger.info("Redis connections closed")
     
     async def init_database(self, session_factory=None):
         """Initialize database session factory."""
@@ -375,6 +517,93 @@ class PersistentDataStore:
             except Exception as e:
                 self._db_available = False
                 logger.warning("Database not available", error=str(e))
+    
+    # =========================================================================
+    # Redis Health Check
+    # =========================================================================
+    
+    async def check_redis_health(self) -> Dict[str, Any]:
+        """
+        Perform health check on Redis connection.
+        
+        Returns:
+            Dict with health status including:
+            - status: 'healthy', 'degraded', 'unhealthy', or 'unavailable'
+            - latency_ms: Response time in milliseconds
+            - last_check: Timestamp of last health check
+            - connection_pool: Pool statistics if available
+        """
+        health_result = {
+            "status": "unavailable",
+            "latency_ms": None,
+            "last_check": datetime.utcnow().isoformat(),
+            "connection_pool": None,
+            "error": None
+        }
+        
+        if not self._redis_client:
+            health_result["error"] = "Redis client not initialized"
+            return health_result
+        
+        try:
+            # Measure ping latency
+            start_time = time.time()
+            await self._redis_client.ping()
+            latency_ms = (time.time() - start_time) * 1000
+            
+            self._redis_latency_ms = latency_ms
+            self._redis_last_health_check = datetime.utcnow()
+            
+            # Determine health status based on latency
+            if latency_ms < 10:
+                status = "healthy"
+            elif latency_ms < 100:
+                status = "degraded"
+            else:
+                status = "slow"
+            
+            self._redis_health_status = status
+            self._redis_available = True
+            
+            health_result.update({
+                "status": status,
+                "latency_ms": round(latency_ms, 2),
+                "connection_pool": {
+                    "max_connections": config.REDIS_MAX_CONNECTIONS
+                }
+            })
+            
+            # Get pool info if available
+            if self._redis_pool:
+                try:
+                    pool_info = await self._redis_client.info("clients")
+                    health_result["connection_pool"]["connected_clients"] = pool_info.get("connected_clients", 0)
+                except Exception:
+                    pass
+            
+        except Exception as e:
+            self._redis_available = False
+            self._redis_health_status = "unhealthy"
+            health_result["status"] = "unhealthy"
+            health_result["error"] = str(e)
+            logger.warning("Redis health check failed", error=str(e))
+        
+        return health_result
+    
+    def get_redis_status(self) -> Dict[str, Any]:
+        """
+        Get current Redis status without performing a health check.
+        """
+        return {
+            "available": self._redis_available,
+            "status": self._redis_health_status,
+            "latency_ms": round(self._redis_latency_ms, 2) if self._redis_latency_ms else None,
+            "last_health_check": self._redis_last_health_check.isoformat() if self._redis_last_health_check else None
+        }
+    
+    # =========================================================================
+    # Rate Limiting (Redis-backed with fallback)
+    # =========================================================================
     
     async def check_rate_limit_redis(self, key: str, limit: int, window: int = 60) -> bool:
         """
@@ -466,6 +695,522 @@ class PersistentDataStore:
                 await self._redis_client.delete(f"refresh_token:{token_hash}")
             except Exception as e:
                 logger.warning("Failed to revoke token from Redis", error=str(e))
+    
+    # =========================================================================
+    # User Session Storage (Redis-backed with fallback)
+    # =========================================================================
+    
+    async def create_session(self, user_id: str, session_data: Dict[str, Any] = None) -> str:
+        """
+        Create a new user session with optional metadata.
+        
+        Args:
+            user_id: The user's ID
+            session_data: Optional additional session data
+        
+        Returns:
+            session_id: Unique session identifier
+        """
+        session_id = str(uuid.uuid4())
+        ttl = config.SESSION_TTL_SECONDS
+        
+        session = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "last_activity": datetime.utcnow().isoformat(),
+            "data": session_data or {}
+        }
+        
+        # Store in Redis if available
+        if self._redis_available and self._redis_client:
+            try:
+                await self._redis_client.setex(
+                    f"session:{session_id}",
+                    ttl,
+                    json.dumps(session)
+                )
+                # Also maintain a user -> sessions index
+                await self._redis_client.sadd(f"user_sessions:{user_id}", session_id)
+                await self._redis_client.expire(f"user_sessions:{user_id}", ttl)
+                logger.debug("Session created in Redis", session_id=session_id, user_id=user_id)
+            except Exception as e:
+                logger.warning("Failed to store session in Redis, using memory", error=str(e))
+                self._store_session_memory(session_id, session, ttl)
+        else:
+            self._store_session_memory(session_id, session, ttl)
+        
+        return session_id
+    
+    def _store_session_memory(self, session_id: str, session: Dict, ttl: int):
+        """Store session in memory with expiration."""
+        self._memory_sessions[session_id] = {
+            "value": session,
+            "expires_at": time.time() + ttl
+        }
+    
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a session by ID.
+        
+        Args:
+            session_id: The session identifier
+        
+        Returns:
+            Session data dict or None if not found/expired
+        """
+        # Try Redis first
+        if self._redis_available and self._redis_client:
+            try:
+                session_data = await self._redis_client.get(f"session:{session_id}")
+                if session_data:
+                    session = json.loads(session_data)
+                    # Update last activity
+                    session["last_activity"] = datetime.utcnow().isoformat()
+                    await self._redis_client.setex(
+                        f"session:{session_id}",
+                        config.SESSION_TTL_SECONDS,
+                        json.dumps(session)
+                    )
+                    return session
+            except Exception as e:
+                logger.warning("Failed to get session from Redis", error=str(e))
+        
+        # Fall back to memory
+        return self._get_session_memory(session_id)
+    
+    def _get_session_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session from memory, checking expiration."""
+        if session_id in self._memory_sessions:
+            entry = self._memory_sessions[session_id]
+            if time.time() < entry["expires_at"]:
+                entry["value"]["last_activity"] = datetime.utcnow().isoformat()
+                return entry["value"]
+            else:
+                # Expired, clean up
+                del self._memory_sessions[session_id]
+        return None
+    
+    async def update_session(self, session_id: str, updates: Dict[str, Any]) -> bool:
+        """
+        Update session data.
+        
+        Args:
+            session_id: The session identifier
+            updates: Dict of fields to update in session data
+        
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        session = await self.get_session(session_id)
+        if not session:
+            return False
+        
+        session["data"].update(updates)
+        session["last_activity"] = datetime.utcnow().isoformat()
+        
+        # Update in Redis if available
+        if self._redis_available and self._redis_client:
+            try:
+                await self._redis_client.setex(
+                    f"session:{session_id}",
+                    config.SESSION_TTL_SECONDS,
+                    json.dumps(session)
+                )
+                return True
+            except Exception as e:
+                logger.warning("Failed to update session in Redis", error=str(e))
+        
+        # Update in memory
+        if session_id in self._memory_sessions:
+            self._memory_sessions[session_id]["value"] = session
+            self._memory_sessions[session_id]["expires_at"] = time.time() + config.SESSION_TTL_SECONDS
+            return True
+        
+        return False
+    
+    async def delete_session(self, session_id: str) -> bool:
+        """
+        Delete a session.
+        
+        Args:
+            session_id: The session identifier
+        
+        Returns:
+            True if deleted successfully
+        """
+        deleted = False
+        
+        # Delete from Redis
+        if self._redis_available and self._redis_client:
+            try:
+                # Get session to find user_id for index cleanup
+                session_data = await self._redis_client.get(f"session:{session_id}")
+                if session_data:
+                    session = json.loads(session_data)
+                    user_id = session.get("user_id")
+                    if user_id:
+                        await self._redis_client.srem(f"user_sessions:{user_id}", session_id)
+                
+                result = await self._redis_client.delete(f"session:{session_id}")
+                deleted = result > 0
+            except Exception as e:
+                logger.warning("Failed to delete session from Redis", error=str(e))
+        
+        # Delete from memory
+        if session_id in self._memory_sessions:
+            del self._memory_sessions[session_id]
+            deleted = True
+        
+        return deleted
+    
+    async def get_user_sessions(self, user_id: str) -> List[str]:
+        """
+        Get all active session IDs for a user.
+        
+        Args:
+            user_id: The user's ID
+        
+        Returns:
+            List of session IDs
+        """
+        session_ids = []
+        
+        # Try Redis first
+        if self._redis_available and self._redis_client:
+            try:
+                session_ids = list(await self._redis_client.smembers(f"user_sessions:{user_id}"))
+            except Exception as e:
+                logger.warning("Failed to get user sessions from Redis", error=str(e))
+        
+        # Also check memory
+        for sid, entry in self._memory_sessions.items():
+            if entry["value"].get("user_id") == user_id and time.time() < entry["expires_at"]:
+                if sid not in session_ids:
+                    session_ids.append(sid)
+        
+        return session_ids
+    
+    async def invalidate_user_sessions(self, user_id: str) -> int:
+        """
+        Invalidate all sessions for a user (e.g., on password change).
+        
+        Args:
+            user_id: The user's ID
+        
+        Returns:
+            Number of sessions invalidated
+        """
+        count = 0
+        
+        session_ids = await self.get_user_sessions(user_id)
+        for session_id in session_ids:
+            if await self.delete_session(session_id):
+                count += 1
+        
+        return count
+    
+    # =========================================================================
+    # Request Caching (Redis-backed with fallback)
+    # =========================================================================
+    
+    async def cache_get(self, key: str) -> Optional[Any]:
+        """
+        Get a value from cache.
+        
+        Args:
+            key: Cache key
+        
+        Returns:
+            Cached value or None if not found/expired
+        """
+        cache_key = f"cache:{key}"
+        
+        # Try Redis first
+        if self._redis_available and self._redis_client:
+            try:
+                value = await self._redis_client.get(cache_key)
+                if value:
+                    return json.loads(value)
+            except Exception as e:
+                logger.debug("Cache get from Redis failed", error=str(e))
+        
+        # Fall back to memory cache
+        return self._cache_get_memory(key)
+    
+    def _cache_get_memory(self, key: str) -> Optional[Any]:
+        """Get value from memory cache."""
+        if key in self._memory_cache:
+            entry = self._memory_cache[key]
+            if time.time() < entry["expires_at"]:
+                return entry["value"]
+            else:
+                del self._memory_cache[key]
+        return None
+    
+    async def cache_set(self, key: str, value: Any, ttl: int = None) -> bool:
+        """
+        Set a value in cache.
+        
+        Args:
+            key: Cache key
+            value: Value to cache (must be JSON serializable)
+            ttl: Time-to-live in seconds (defaults to CACHE_TTL_SECONDS)
+        
+        Returns:
+            True if cached successfully
+        """
+        if ttl is None:
+            ttl = config.CACHE_TTL_SECONDS
+        
+        cache_key = f"cache:{key}"
+        
+        # Store in Redis if available
+        if self._redis_available and self._redis_client:
+            try:
+                await self._redis_client.setex(
+                    cache_key,
+                    ttl,
+                    json.dumps(value)
+                )
+                return True
+            except Exception as e:
+                logger.debug("Cache set to Redis failed", error=str(e))
+        
+        # Fall back to memory cache
+        self._memory_cache[key] = {
+            "value": value,
+            "expires_at": time.time() + ttl
+        }
+        return True
+    
+    async def cache_delete(self, key: str) -> bool:
+        """
+        Delete a value from cache.
+        
+        Args:
+            key: Cache key
+        
+        Returns:
+            True if deleted
+        """
+        cache_key = f"cache:{key}"
+        deleted = False
+        
+        # Delete from Redis
+        if self._redis_available and self._redis_client:
+            try:
+                result = await self._redis_client.delete(cache_key)
+                deleted = result > 0
+            except Exception as e:
+                logger.debug("Cache delete from Redis failed", error=str(e))
+        
+        # Delete from memory
+        if key in self._memory_cache:
+            del self._memory_cache[key]
+            deleted = True
+        
+        return deleted
+    
+    async def cache_clear_pattern(self, pattern: str) -> int:
+        """
+        Clear cache entries matching a pattern.
+        
+        Args:
+            pattern: Key pattern (e.g., "user:*" to clear all user-related cache)
+        
+        Returns:
+            Number of keys deleted
+        """
+        count = 0
+        cache_pattern = f"cache:{pattern}"
+        
+        # Clear from Redis
+        if self._redis_available and self._redis_client:
+            try:
+                cursor = 0
+                while True:
+                    cursor, keys = await self._redis_client.scan(cursor, match=cache_pattern, count=100)
+                    if keys:
+                        count += await self._redis_client.delete(*keys)
+                    if cursor == 0:
+                        break
+            except Exception as e:
+                logger.warning("Cache clear pattern from Redis failed", error=str(e))
+        
+        # Clear from memory (simple pattern matching)
+        import fnmatch
+        keys_to_delete = [k for k in self._memory_cache.keys() if fnmatch.fnmatch(k, pattern)]
+        for k in keys_to_delete:
+            del self._memory_cache[k]
+            count += 1
+        
+        return count
+    
+    # =========================================================================
+    # Redis Pub/Sub for Real-time Updates
+    # =========================================================================
+    
+    async def publish(self, channel: str, message: Dict[str, Any]) -> int:
+        """
+        Publish a message to a Redis channel.
+        
+        Args:
+            channel: Channel name
+            message: Message data (will be JSON serialized)
+        
+        Returns:
+            Number of subscribers that received the message
+        """
+        if not self._redis_available or not self._redis_client:
+            logger.debug("Redis not available for pub/sub")
+            return 0
+        
+        try:
+            result = await self._redis_client.publish(
+                f"aoai:{channel}",
+                json.dumps(message)
+            )
+            return result
+        except Exception as e:
+            logger.warning("Failed to publish message", channel=channel, error=str(e))
+            return 0
+    
+    async def subscribe(self, channel: str, handler: Callable[[Dict[str, Any]], None]):
+        """
+        Subscribe to a Redis channel with a handler callback.
+        
+        Args:
+            channel: Channel name
+            handler: Async callback function to handle messages
+        """
+        if not self._pubsub_client:
+            logger.warning("Pub/sub client not initialized")
+            return
+        
+        full_channel = f"aoai:{channel}"
+        
+        # Register handler
+        if full_channel not in self._pubsub_handlers:
+            self._pubsub_handlers[full_channel] = []
+        self._pubsub_handlers[full_channel].append(handler)
+        
+        try:
+            await self._pubsub_client.subscribe(full_channel)
+            
+            # Start listener task if not running
+            if not self._pubsub_task or self._pubsub_task.done():
+                self._pubsub_task = asyncio.create_task(self._pubsub_listener())
+            
+            logger.info("Subscribed to channel", channel=channel)
+        except Exception as e:
+            logger.warning("Failed to subscribe to channel", channel=channel, error=str(e))
+    
+    async def unsubscribe(self, channel: str):
+        """
+        Unsubscribe from a Redis channel.
+        
+        Args:
+            channel: Channel name
+        """
+        if not self._pubsub_client:
+            return
+        
+        full_channel = f"aoai:{channel}"
+        
+        try:
+            await self._pubsub_client.unsubscribe(full_channel)
+            if full_channel in self._pubsub_handlers:
+                del self._pubsub_handlers[full_channel]
+            logger.info("Unsubscribed from channel", channel=channel)
+        except Exception as e:
+            logger.warning("Failed to unsubscribe from channel", channel=channel, error=str(e))
+    
+    async def _pubsub_listener(self):
+        """
+        Background task to listen for pub/sub messages.
+        """
+        if not self._pubsub_client:
+            return
+        
+        try:
+            async for message in self._pubsub_client.listen():
+                if message["type"] == "message":
+                    channel = message["channel"]
+                    try:
+                        data = json.loads(message["data"])
+                    except json.JSONDecodeError:
+                        data = {"raw": message["data"]}
+                    
+                    # Call registered handlers
+                    handlers = self._pubsub_handlers.get(channel, [])
+                    for handler in handlers:
+                        try:
+                            if asyncio.iscoroutinefunction(handler):
+                                await handler(data)
+                            else:
+                                handler(data)
+                        except Exception as e:
+                            logger.error("Pub/sub handler error", channel=channel, error=str(e))
+        except asyncio.CancelledError:
+            logger.debug("Pub/sub listener cancelled")
+        except Exception as e:
+            logger.error("Pub/sub listener error", error=str(e))
+    
+    # =========================================================================
+    # Convenience Methods for Common Pub/Sub Events
+    # =========================================================================
+    
+    async def broadcast_model_update(self, model_id: str, update_type: str, data: Dict = None):
+        """Broadcast model update event."""
+        await self.publish("model_updates", {
+            "model_id": model_id,
+            "update_type": update_type,
+            "data": data or {},
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    async def broadcast_system_event(self, event_type: str, data: Dict = None):
+        """Broadcast system event."""
+        await self.publish("system_events", {
+            "event_type": event_type,
+            "data": data or {},
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # =========================================================================
+    # Memory Cache Cleanup
+    # =========================================================================
+    
+    def cleanup_expired_memory_cache(self):
+        """
+        Clean up expired entries from in-memory caches.
+        Should be called periodically.
+        """
+        now = time.time()
+        
+        # Clean up cache
+        expired_cache = [k for k, v in self._memory_cache.items() if v["expires_at"] <= now]
+        for k in expired_cache:
+            del self._memory_cache[k]
+        
+        # Clean up sessions
+        expired_sessions = [k for k, v in self._memory_sessions.items() if v["expires_at"] <= now]
+        for k in expired_sessions:
+            del self._memory_sessions[k]
+        
+        # Clean up rate limits (older than 1 minute)
+        for key in list(self.rate_limits.keys()):
+            self.rate_limits[key] = [t for t in self.rate_limits[key] if now - t < 60]
+            if not self.rate_limits[key]:
+                del self.rate_limits[key]
+        
+        if expired_cache or expired_sessions:
+            logger.debug(
+                "Cleaned up expired entries",
+                cache_entries=len(expired_cache),
+                sessions=len(expired_sessions)
+            )
     
     async def add_user(self, user: User):
         """Add user with persistence."""
@@ -633,6 +1378,18 @@ async def check_rate_limit(
 # Application Setup
 # =============================================================================
 
+async def periodic_cleanup_task():
+    """Background task for periodic cache cleanup."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Every 5 minutes
+            store.cleanup_expired_memory_cache()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Periodic cleanup failed", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -641,8 +1398,20 @@ async def lifespan(app: FastAPI):
     # Initialize Redis if available
     try:
         await store.init_redis()
+        redis_status = store.get_redis_status()
+        if redis_status["available"]:
+            logger.info(
+                "✅ Redis connected",
+                status=redis_status["status"],
+                latency_ms=redis_status["latency_ms"]
+            )
+        else:
+            logger.warning("⚠️ Redis not available, using in-memory fallback")
     except Exception as e:
         logger.warning("Redis initialization failed, continuing without Redis", error=str(e))
+    
+    # Start periodic cleanup task
+    cleanup_task = asyncio.create_task(periodic_cleanup_task())
     
     # Create demo user and API key for testing
     demo_user = User(
@@ -670,7 +1439,17 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup: save data before shutdown
+    # Cleanup: cancel background tasks
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Close Redis connections gracefully
+    await store.close_redis()
+    
+    # Save data before shutdown
     store._save_to_cache()
     logger.info("👋 ActuallyOpenAI API shutting down...")
 
@@ -735,8 +1514,28 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "total_requests": store.total_requests,
-        "total_tokens_processed": store.total_tokens
+        "total_tokens_processed": store.total_tokens,
+        "redis": store.get_redis_status()
     }
+
+
+@app.get("/health/redis", tags=["Health"])
+async def redis_health_check():
+    """
+    Detailed Redis health check endpoint.
+    Performs an active health check including latency measurement.
+    """
+    health = await store.check_redis_health()
+    
+    status_code = 200
+    if health["status"] == "unhealthy":
+        status_code = 503
+    elif health["status"] == "unavailable":
+        status_code = 503
+    elif health["status"] == "degraded":
+        status_code = 200  # Still operational, just slower
+    
+    return JSONResponse(content=health, status_code=status_code)
 
 
 @app.get("/v1/models", tags=["Models"])
@@ -744,7 +1543,7 @@ async def list_models(user: User = Depends(get_current_user)):
     """List available models (OpenAI compatible)."""
     return {
         "object": "list",
-        "data": [model.dict() for model in store.models.values()]
+        "data": [model.model_dump() for model in store.models.values()]
     }
 
 
@@ -753,7 +1552,7 @@ async def get_model(model_id: str, user: User = Depends(get_current_user)):
     """Get model details."""
     if model_id not in store.models:
         raise HTTPException(status_code=404, detail="Model not found")
-    return store.models[model_id].dict()
+    return store.models[model_id].model_dump()
 
 
 # =============================================================================

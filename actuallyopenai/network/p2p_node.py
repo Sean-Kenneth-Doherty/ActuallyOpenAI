@@ -15,10 +15,12 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Set
+from typing import Dict, List, Optional, Callable, Set, Tuple
 from enum import Enum
 import threading
 import logging
+
+from actuallyopenai.config import get_settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AOAI-P2P")
@@ -109,32 +111,40 @@ class P2PNode:
     - Gossip protocol for network state
     - Work distribution without central coordinator
     - Byzantine fault tolerance
+    
+    Bootstrap nodes can be configured via P2P_BOOTSTRAP_NODES environment variable
+    (comma-separated list of host:port pairs).
     """
     
-    # Bootstrap nodes - hardcoded entry points to the network
-    BOOTSTRAP_NODES = [
+    # Default bootstrap nodes - used when no env config is provided
+    DEFAULT_BOOTSTRAP_NODES = [
         ("bootstrap1.actuallyopenai.org", 31337),
         ("bootstrap2.actuallyopenai.org", 31337),
         ("bootstrap3.actuallyopenai.org", 31337),
-        # Also try local network discovery
-        ("255.255.255.255", 31337),  # Broadcast
     ]
     
     def __init__(
         self,
         host: str = "0.0.0.0",
         port: int = 31337,
-        node_id: Optional[str] = None
+        node_id: Optional[str] = None,
+        bootstrap_nodes: Optional[List[Tuple[str, int]]] = None,
+        use_defaults: bool = False
     ):
         # Generate unique node ID from hardware fingerprint
         self.node_id = node_id or self._generate_node_id()
         self.host = host
         self.port = port
         
+        # Initialize bootstrap nodes from config, parameter, or defaults
+        self._bootstrap_nodes: List[Tuple[str, int]] = []
+        self._init_bootstrap_nodes(bootstrap_nodes, use_defaults)
+        
         # Peer management
         self.peers: Dict[str, Peer] = {}
         self.known_peers: Set[tuple] = set()
-        self.max_peers = 50
+        settings = get_settings()
+        self.max_peers = settings.p2p_max_peers
         
         # Network state
         self.is_running = False
@@ -182,6 +192,104 @@ class P2PNode:
         
         fingerprint = f"{platform.node()}-{uuid.getnode()}-{time.time()}"
         return hashlib.sha256(fingerprint.encode()).hexdigest()
+    
+    def _init_bootstrap_nodes(
+        self,
+        bootstrap_nodes: Optional[List[Tuple[str, int]]],
+        use_defaults: bool
+    ) -> None:
+        """Initialize bootstrap nodes from config, parameter, or defaults.
+        
+        Priority:
+        1. Explicit bootstrap_nodes parameter (if provided)
+        2. Environment variable P2P_BOOTSTRAP_NODES (if set)
+        3. Default bootstrap nodes (only if use_defaults=True)
+        
+        Args:
+            bootstrap_nodes: Optional list of (host, port) tuples
+            use_defaults: Whether to fall back to DEFAULT_BOOTSTRAP_NODES
+        """
+        if bootstrap_nodes is not None:
+            # Use explicitly provided nodes
+            self._bootstrap_nodes = list(bootstrap_nodes)
+            logger.info(f"📡 Using {len(self._bootstrap_nodes)} provided bootstrap node(s)")
+            return
+        
+        # Try to load from environment config
+        settings = get_settings()
+        env_nodes = settings.get_bootstrap_nodes()
+        
+        if env_nodes:
+            self._bootstrap_nodes = env_nodes
+            logger.info(f"📡 Loaded {len(self._bootstrap_nodes)} bootstrap node(s) from environment")
+            return
+        
+        # Fall back to defaults only if explicitly requested
+        if use_defaults:
+            self._bootstrap_nodes = list(self.DEFAULT_BOOTSTRAP_NODES)
+            logger.info(f"📡 Using {len(self._bootstrap_nodes)} default bootstrap node(s)")
+        else:
+            self._bootstrap_nodes = []
+            logger.info("📡 No bootstrap nodes configured (local discovery only)")
+    
+    def add_bootstrap_node(self, host: str, port: int) -> bool:
+        """Add a bootstrap node dynamically.
+        
+        Args:
+            host: Hostname or IP address of the node
+            port: Port number (1-65535)
+            
+        Returns:
+            True if node was added, False if invalid or already exists
+        """
+        if not (1 <= port <= 65535):
+            logger.warning(f"Invalid port {port} for bootstrap node")
+            return False
+        
+        if not host:
+            logger.warning("Empty host for bootstrap node")
+            return False
+        
+        node = (host, port)
+        if node in self._bootstrap_nodes:
+            logger.debug(f"Bootstrap node {host}:{port} already exists")
+            return False
+        
+        self._bootstrap_nodes.append(node)
+        logger.info(f"📡 Added bootstrap node: {host}:{port}")
+        return True
+    
+    def remove_bootstrap_node(self, host: str, port: int) -> bool:
+        """Remove a bootstrap node dynamically.
+        
+        Args:
+            host: Hostname or IP address of the node
+            port: Port number
+            
+        Returns:
+            True if node was removed, False if not found
+        """
+        node = (host, port)
+        if node in self._bootstrap_nodes:
+            self._bootstrap_nodes.remove(node)
+            logger.info(f"📡 Removed bootstrap node: {host}:{port}")
+            return True
+        
+        logger.debug(f"Bootstrap node {host}:{port} not found")
+        return False
+    
+    def get_bootstrap_nodes(self) -> List[Tuple[str, int]]:
+        """Get the current list of bootstrap nodes.
+        
+        Returns:
+            List of (host, port) tuples
+        """
+        return list(self._bootstrap_nodes)
+    
+    def clear_bootstrap_nodes(self) -> None:
+        """Remove all bootstrap nodes."""
+        self._bootstrap_nodes.clear()
+        logger.info("📡 Cleared all bootstrap nodes")
     
     def _register_default_handlers(self):
         """Register default message handlers"""
@@ -275,13 +383,16 @@ class P2PNode:
     
     async def _bootstrap(self):
         """Bootstrap into the network by connecting to known nodes"""
-        logger.info("🔍 Bootstrapping into the network...")
-        
-        for host, port in self.BOOTSTRAP_NODES:
-            try:
-                await self._connect_to_peer(host, port)
-            except Exception as e:
-                logger.debug(f"Bootstrap node {host}:{port} unavailable: {e}")
+        if not self._bootstrap_nodes:
+            logger.info("🔍 No bootstrap nodes configured, relying on local discovery only")
+        else:
+            logger.info(f"🔍 Bootstrapping into the network with {len(self._bootstrap_nodes)} node(s)...")
+            
+            for host, port in self._bootstrap_nodes:
+                try:
+                    await self._connect_to_peer(host, port)
+                except Exception as e:
+                    logger.debug(f"Bootstrap node {host}:{port} unavailable: {e}")
         
         # Also try local network discovery
         await self._local_discovery()

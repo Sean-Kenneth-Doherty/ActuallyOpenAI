@@ -549,7 +549,7 @@ async def get_contributor(wallet: str):
     if not contributor:
         raise HTTPException(status_code=404, detail="Contributor not found")
     
-    return contributor.dict()
+    return contributor.model_dump()
 
 
 @app.get("/api/leaderboard")
@@ -561,7 +561,7 @@ async def get_leaderboard(limit: int = 100):
         reverse=True
     )[:limit]
     
-    return [c.dict() for c in sorted_contributors]
+    return [c.model_dump() for c in sorted_contributors]
 
 
 if __name__ == "__main__":

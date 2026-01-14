@@ -48,7 +48,7 @@ class ModelVersionDB:
         """Save model versions to file."""
         try:
             file_path = self._get_file_path(model_id)
-            data = [v.dict() for v in versions]
+            data = [v.model_dump() for v in versions]
             # Convert datetime to ISO format for JSON serialization
             for item in data:
                 if isinstance(item.get('created_at'), datetime):
@@ -125,7 +125,7 @@ class ModelRegistry:
         try:
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
             data = {
-                'models': [m.dict() for m in self.models.values()],
+                'models': [m.model_dump() for m in self.models.values()],
                 'updated_at': datetime.utcnow().isoformat()
             }
             with open(cache_file, 'w') as f:

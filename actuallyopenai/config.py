@@ -4,7 +4,7 @@ Configuration management for OpenCollective AI.
 
 from functools import lru_cache
 from typing import Optional
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 
@@ -61,10 +61,67 @@ class Settings(BaseSettings):
     enable_metrics: bool = Field(default=True)
     log_level: str = Field(default="INFO")
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    # P2P Network
+    p2p_bootstrap_nodes: str = Field(
+        default="",
+        description="Comma-separated list of bootstrap nodes in host:port format"
+    )
+    p2p_port: int = Field(default=31337)
+    p2p_max_peers: int = Field(default=50)
+    
+    def get_bootstrap_nodes(self) -> list:
+        """Parse and validate bootstrap nodes from environment variable.
+        
+        Returns:
+            List of tuples (host, port) for valid bootstrap nodes.
+        """
+        if not self.p2p_bootstrap_nodes:
+            return []
+        
+        nodes = []
+        for node in self.p2p_bootstrap_nodes.split(","):
+            node = node.strip()
+            if not node:
+                continue
+            
+            if not self._validate_node_format(node):
+                continue
+            
+            try:
+                host, port_str = node.rsplit(":", 1)
+                port = int(port_str)
+                if 1 <= port <= 65535:
+                    nodes.append((host, port))
+            except ValueError:
+                continue
+        
+        return nodes
+    
+    @staticmethod
+    def _validate_node_format(node: str) -> bool:
+        """Validate that a node string is in host:port format.
+        
+        Args:
+            node: Node address string to validate.
+            
+        Returns:
+            True if valid format, False otherwise.
+        """
+        if ":" not in node:
+            return False
+        
+        try:
+            host, port_str = node.rsplit(":", 1)
+            port = int(port_str)
+            return bool(host) and 1 <= port <= 65535
+        except ValueError:
+            return False
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False
+    )
 
 
 @lru_cache()
