@@ -163,11 +163,11 @@ class ScalingNode:
             
             # Create model factory
             def model_factory(scale: str):
-                config = ScalableConfig.from_scale(scale)
+                config = ScalableConfig.for_scale(scale)
                 return ScalableAOAI(config)
             
             # Initialize scalable model
-            config = ScalableConfig.from_scale(self.initial_scale)
+            config = ScalableConfig.for_scale(self.initial_scale)
             self.scalable_model = ScalableAOAI(config)
             
             model_params = sum(p.numel() for p in self.scalable_model.parameters())
