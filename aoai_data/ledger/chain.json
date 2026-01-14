@@ -30,10 +30,186 @@
       "timestamp": 1768346771.8534114,
       "nonce": 268,
       "hash": "0091c6436a077197abe47c9c6731a4f56c368a6937074d8372eec132e62f023b"
+    },
+    {
+      "index": 2,
+      "transactions": [
+        {
+          "tx_id": "b1580ec074ed7b21138ff51142e0a000435c2ff99687009c660dafdcce8db1b2",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347527.9962866,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        }
+      ],
+      "previous_hash": "0091c6436a077197abe47c9c6731a4f56c368a6937074d8372eec132e62f023b",
+      "timestamp": 1768347531.4748888,
+      "nonce": 39,
+      "hash": "0019fcda11993268c14558556d847c5dcb95d718659568dfcda8f7e32beb04ec"
+    },
+    {
+      "index": 3,
+      "transactions": [
+        {
+          "tx_id": "1bf58e3585fc85e7bd73bd60d3d60b606f8a0daa40babebdc2826d08198b2171",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347639.6729202,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        }
+      ],
+      "previous_hash": "0019fcda11993268c14558556d847c5dcb95d718659568dfcda8f7e32beb04ec",
+      "timestamp": 1768347641.0431137,
+      "nonce": 256,
+      "hash": "000f54d8d8be69018552e62bed6088d1c7ca5139237f68cfd2faba3b03bfe369"
+    },
+    {
+      "index": 4,
+      "transactions": [
+        {
+          "tx_id": "33d2bf5526fd600b954cde68486249cc16de4108380227273be92cc685dd8b56",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347647.9386227,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "a0ff14fca8fd029d2be883c3ff7530e92f17d4b0c59da099f6568bc2827ab635",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347648.1084998,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "715ebb8caf5cd8797789c1f73b296f434e80c5883e8118e14cc216bce6151051",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347648.2391055,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "c889375d5c7e542ee446a1460d1acbf4a5aa9181bb02075aa3f13da3ba386202",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347648.4209766,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "bd513d5499760a64435a6d5cba77f5701b2edec61ac557d50f90d16e37c5a08a",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347648.552022,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        }
+      ],
+      "previous_hash": "000f54d8d8be69018552e62bed6088d1c7ca5139237f68cfd2faba3b03bfe369",
+      "timestamp": 1768347651.0651474,
+      "nonce": 251,
+      "hash": "008fa23513a90bb7ee169f49136b0d37b324f540bb0aa84aa0779a82f454dc1c"
+    },
+    {
+      "index": 5,
+      "transactions": [
+        {
+          "tx_id": "8b790cdf52c08da710c6b11e9abc62a37eaf944ee5465757a1f26d6e7f7da9a3",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347795.6264517,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "1c9af1057172f4278ebbbd45f779d6a3348aa59f7ff6f577beffb5ad592b94f2",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347795.738698,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        },
+        {
+          "tx_id": "6eb4c35c38efcdcec51d650d5373f1c5a7fbdbe515151cdc140feb292b315b69",
+          "type": "reward",
+          "sender": "NETWORK",
+          "receiver": "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89",
+          "amount": 100.0,
+          "timestamp": 1768347795.886038,
+          "data": {
+            "compute_units": 1.0,
+            "work_proof": "7f82cebf5d55c156e39b4ad277299fc407d1621450743c38af3e603bf3c90936",
+            "block_reward": 100.0
+          },
+          "signature": ""
+        }
+      ],
+      "previous_hash": "008fa23513a90bb7ee169f49136b0d37b324f540bb0aa84aa0779a82f454dc1c",
+      "timestamp": 1768347803.1954815,
+      "nonce": 18,
+      "hash": "0069e5f91f9e1b39d14622b0a46f46ea932640f68b2ea24b74fb81e9d8ac27cf"
     }
   ],
   "balances": {
-    "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89": 10.0
+    "aoai_de6a6cc9a3ec36e86807440aa28dc5557c8fbb89": 1010.0
   },
-  "total_minted": 10.0
+  "total_minted": 1010.0
 }

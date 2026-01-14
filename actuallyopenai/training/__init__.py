@@ -45,6 +45,29 @@ from actuallyopenai.training.improvement_tracker import (
 )
 from actuallyopenai.training.training_orchestrator import TrainingOrchestrator
 
+# Frontier scaling components
+try:
+    from actuallyopenai.training.distributed_pretraining import (
+        DistributedTrainer,
+        ProgressiveScaler,
+        GradientCompressor,
+    )
+except ImportError:
+    DistributedTrainer = None
+    ProgressiveScaler = None
+    GradientCompressor = None
+
+try:
+    from actuallyopenai.training.continuous_improvement import (
+        ContinuousImprovementEngine,
+        QualityMonitor,
+        FeedbackCollector,
+    )
+except ImportError:
+    ContinuousImprovementEngine = None
+    QualityMonitor = None
+    FeedbackCollector = None
+
 __all__ = [
     # Core trainer
     "ContinuousTrainer",
@@ -74,4 +97,11 @@ __all__ = [
     "QualityReport",
     # Orchestrator
     "TrainingOrchestrator",
+    # Frontier scaling
+    "DistributedTrainer",
+    "ProgressiveScaler",
+    "GradientCompressor",
+    "ContinuousImprovementEngine",
+    "QualityMonitor",
+    "FeedbackCollector",
 ]

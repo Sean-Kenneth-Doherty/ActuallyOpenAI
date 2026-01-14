@@ -11,6 +11,20 @@ from .p2p_node import P2PNode, Peer, Message, MessageType
 from .ipfs_storage import IPFSModelStorage, ModelRegistry
 from .api_mesh import DecentralizedAPIMesh, LoadBalancer
 
+# Frontier scaling network components
+try:
+    from .compute_aggregator import (
+        NetworkComputeAggregator,
+        ComputeCapability,
+        TrainingJob,
+        NodeRole,
+    )
+except ImportError:
+    NetworkComputeAggregator = None
+    ComputeCapability = None
+    TrainingJob = None
+    NodeRole = None
+
 __all__ = [
     "P2PNode",
     "Peer", 
@@ -19,5 +33,10 @@ __all__ = [
     "IPFSModelStorage",
     "ModelRegistry",
     "DecentralizedAPIMesh",
-    "LoadBalancer"
+    "LoadBalancer",
+    # Frontier scaling
+    "NetworkComputeAggregator",
+    "ComputeCapability",
+    "TrainingJob",
+    "NodeRole",
 ]
